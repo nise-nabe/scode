@@ -54,6 +54,9 @@ pub struct IndexArgs {
     /// Optional cache dir for downloaded jars
     #[serde(default)]
     pub cache_dir: Option<String>,
+    /// Maven-layout repository base URL (overrides frozen TOML `repository`)
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 fn default_token_mode() -> String {
@@ -131,6 +134,7 @@ impl ScodeMcp {
             mode,
             args.fetch,
             cache.as_deref(),
+            args.repository.as_deref(),
         )
         .map_err(map_err)?;
 

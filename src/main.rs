@@ -35,6 +35,9 @@ enum Command {
         /// Cache directory for downloaded jars
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Maven-layout repository base URL (overrides frozen TOML `repository`)
+        #[arg(long)]
+        repository: Option<String>,
     },
     /// Locate a simple name
     Search {
@@ -90,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             token_mode,
             fetch,
             cache_dir,
+            repository,
         } => {
             if backend != "delta" {
                 anyhow::bail!("unsupported backend `{backend}` (only `delta`)");
@@ -100,6 +104,7 @@ fn main() -> anyhow::Result<()> {
                 token_mode.into(),
                 fetch,
                 cache_dir.as_deref(),
+                repository.as_deref(),
             )?;
             let stats = index.stats();
             eprintln!(

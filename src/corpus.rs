@@ -68,6 +68,10 @@ impl CorpusInput {
 
 #[derive(Debug, Deserialize)]
 struct FrozenFile {
+    /// Default Maven-layout repository base URL (no hardcoded host in scode).
+    /// Example: `https://repo1.maven.org/maven2`
+    #[serde(default)]
+    repository: Option<String>,
     #[serde(default)]
     artifacts: Vec<GavEntry>,
 }
@@ -77,6 +81,12 @@ pub struct GavEntry {
     pub group: String,
     pub artifact: String,
     pub version: String,
+    /// Per-artifact repository base URL override.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Full URL to the `-sources.jar` (skips Maven-layout join).
+    #[serde(default)]
+    pub sources_url: Option<String>,
 }
 
 impl GavEntry {
@@ -84,14 +94,40 @@ impl GavEntry {
         format!("{}:{}:{}", self.group, self.artifact, self.version)
     }
 
-    pub fn sources_url(&self) -> String {
-        let group_path = self.group.replace('.', "/");
-        format!(
-            "https://repo1.maven.org/maven2/{group_path}/{artifact}/{version}/{artifact}-{version}-sources.jar",
-            artifact = self.artifact,
-            version = self.version,
-        )
+    /// Resolve the sources jar URL.
+    ///
+    /// Priority: `sources_url` → entry `repository` → `repo_override` (CLI/MCP)
+    /// → file-level `file_repository`. There is no built-in default host.
+    pub fn resolve_sources_url(
+        &self,
+        file_repository: Option<&str>,
+        repo_override: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if let Some(url) = self.sources_url.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(url.to_string());
+        }
+        let repo = self
+            .repository
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| repo_override.filter(|s| !s.is_empty()))
+            .or_else(|| file_repository.filter(|s| !s.is_empty()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Maven repository for {}:{}:{} — set `repository` in the frozen TOML, \
+                     per-artifact `repository`/`sources_url`, or pass --repository",
+                    self.group, self.artifact, self.version
+                )
+            })?;
+        Ok(maven_sources_url(repo, &self.group, &self.artifact, &self.version))
     }
+}
+
+/// Join a Maven-layout repository base with GAV into a `-sources.jar` URL.
+pub fn maven_sources_url(repository: &str, group: &str, artifact: &str, version: &str) -> String {
+    let base = repository.trim_end_matches('/');
+    let group_path = group.replace('.', "/");
+    format!("{base}/{group_path}/{artifact}/{version}/{artifact}-{version}-sources.jar")
 }
 
 /// Load all source documents from an input.
@@ -99,10 +135,11 @@ pub fn load_docs(
     input: &CorpusInput,
     fetch: bool,
     cache_dir: Option<&Path>,
+    repository: Option<&str>,
 ) -> anyhow::Result<Vec<SourceDoc>> {
     match input {
         CorpusInput::Tree(root) => load_tree(root, "local:tree:0"),
-        CorpusInput::FrozenGavs(toml_path) => load_frozen(toml_path, fetch, cache_dir),
+        CorpusInput::FrozenGavs(toml_path) => load_frozen(toml_path, fetch, cache_dir, repository),
     }
 }
 
@@ -154,6 +191,7 @@ fn load_frozen(
     toml_path: &Path,
     fetch: bool,
     cache_dir: Option<&Path>,
+    repository: Option<&str>,
 ) -> anyhow::Result<Vec<SourceDoc>> {
     let text = fs::read_to_string(toml_path)?;
     let file: FrozenFile = toml::from_str(&text)?;
@@ -170,6 +208,7 @@ fn load_frozen(
         });
     fs::create_dir_all(&cache)?;
 
+    let file_repo = file.repository.as_deref();
     let mut docs = Vec::new();
     for gav in &file.artifacts {
         let jar_path = cache.join(format!(
@@ -185,17 +224,17 @@ fn load_frozen(
                     jar_path.display()
                 );
             }
-            download_sources(gav, &jar_path)?;
+            let url = gav.resolve_sources_url(file_repo, repository)?;
+            download_url(&url, &jar_path)?;
         }
         docs.extend(load_sources_jar(&jar_path, &gav.coordinate())?);
     }
     Ok(docs)
 }
 
-fn download_sources(gav: &GavEntry, dest: &Path) -> anyhow::Result<()> {
-    let url = gav.sources_url();
+fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     eprintln!("fetching {url}");
-    let resp = ureq::get(&url)
+    let resp = ureq::get(url)
         .call()
         .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
     let mut bytes = Vec::new();
@@ -207,6 +246,60 @@ fn download_sources(gav: &GavEntry, dest: &Path) -> anyhow::Result<()> {
     }
     fs::write(dest, bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maven_url_join_trims_slash() {
+        let url = maven_sources_url(
+            "https://example.corp/maven2/",
+            "com.acme",
+            "lib",
+            "1.2.3",
+        );
+        assert_eq!(
+            url,
+            "https://example.corp/maven2/com/acme/lib/1.2.3/lib-1.2.3-sources.jar"
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_sources_url_then_entry_repo() {
+        let mut gav = GavEntry {
+            group: "g".into(),
+            artifact: "a".into(),
+            version: "1".into(),
+            repository: Some("https://entry.example/m2".into()),
+            sources_url: Some("https://cdn.example/a-sources.jar".into()),
+        };
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://cdn.example/a-sources.jar"
+        );
+        gav.sources_url = None;
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://entry.example/m2/g/a/1/a-1-sources.jar"
+        );
+        gav.repository = None;
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://cli.example/m2/g/a/1/a-1-sources.jar"
+        );
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), None)
+                .unwrap(),
+            "https://file.example/m2/g/a/1/a-1-sources.jar"
+        );
+        let err = gav.resolve_sources_url(None, None).unwrap_err().to_string();
+        assert!(err.contains("no Maven repository"), "{err}");
+    }
 }
 
 fn load_sources_jar(jar: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {

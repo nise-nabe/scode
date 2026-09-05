@@ -27,8 +27,11 @@ scode search-multi --index /tmp/scode-demo -q HttpClient -q Foo --json
 # Wider tokens (comments/strings included; closer to rg word-boundary identity)
 scode index --input fixtures/demo --out /tmp/scode-all --token-mode all
 
-# Frozen GAV list (downloads sources jars with --fetch)
+# Frozen GAV list (downloads sources jars with --fetch).
+# Repository URL comes from the TOML `repository` field, or --repository.
 scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
+# scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch \
+#   --repository https://my.mirror/maven2
 ```
 
 ### Token modes
@@ -37,6 +40,23 @@ scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
 |------|---------|
 | `idents` (default) | Java/Kotlin identifiers in code only |
 | `all` | Identifier-shaped tokens across the whole file |
+
+### Frozen GAV repository
+
+scode does **not** hardcode a Maven host. For `--fetch`, set one of:
+
+1. Top-level `repository` in the frozen TOML
+2. Per-artifact `repository` or `sources_url`
+3. CLI/MCP `--repository` / `repository` (overrides the file default)
+
+```toml
+repository = "https://repo1.maven.org/maven2"
+
+[[artifacts]]
+group = "com.acme"
+artifact = "lib"
+version = "1.0.0"
+```
 
 ### Output
 

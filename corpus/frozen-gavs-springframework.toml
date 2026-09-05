@@ -1,4 +1,8 @@
 # Tree S — Spring Framework 7.0.9 via spring-context (from paper draft).
+#
+# `repository` is required for --fetch (scode has no built-in Maven host).
+
+repository = "https://repo1.maven.org/maven2"
 
 [[artifacts]]
 group = "org.springframework"
