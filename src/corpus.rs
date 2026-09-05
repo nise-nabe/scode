@@ -1,7 +1,7 @@
 //! Corpus ingestion: source trees, frozen GAV TOML, local Maven/Gradle caches.
 
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -349,14 +349,14 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("read body: {e}"))?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(dest, bytes)?;
+    let mut file = fs::File::create(dest)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", dest.display()))?;
+    let mut reader = resp.into_reader();
+    io::copy(&mut reader, &mut file)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", dest.display()))?;
     Ok(())
 }
 

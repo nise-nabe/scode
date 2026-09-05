@@ -112,7 +112,11 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Encode a non-decreasing sequence of positions as gap+Elias-δ.
+/// Encode a strictly increasing sequence of positions as gap+Elias-δ.
+///
+/// # Panics
+/// Panics if `positions` contains duplicates or is not sorted ascending
+/// (Elias-δ gaps must be ≥ 1).
 pub fn encode_gaps(positions: &[u32]) -> Vec<u8> {
     if positions.is_empty() {
         return Vec::new();
@@ -123,7 +127,11 @@ pub fn encode_gaps(positions: &[u32]) -> Vec<u8> {
         let gap = if i == 0 {
             p.checked_add(1).expect("position overflow")
         } else {
-            p.checked_sub(prev).expect("positions must be sorted")
+            assert!(
+                p > prev,
+                "positions must be strictly increasing (got {prev} then {p})"
+            );
+            p - prev
         };
         w.write_delta(u64::from(gap));
         prev = p;
@@ -181,5 +189,11 @@ mod tests {
     fn empty_gaps() {
         assert!(encode_gaps(&[]).is_empty());
         assert!(decode_gaps(&[], 0).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "strictly increasing")]
+    fn gaps_reject_duplicates() {
+        let _ = encode_gaps(&[1, 1, 2]);
     }
 }

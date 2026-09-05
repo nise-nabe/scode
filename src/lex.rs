@@ -18,168 +18,177 @@ pub fn tokenize(source: &str, mode: TokenMode) -> Vec<Occurrence> {
     }
 }
 
+/// Java/Kotlin-style identifier start: Unicode letter, `_`, or `$`.
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_' || c == '$'
+    c.is_alphabetic() || c == '_' || c == '$'
 }
 
+/// Java/Kotlin-style identifier continue: letter, digit, `_`, or `$`.
 fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    c.is_alphanumeric() || c == '_' || c == '$'
 }
 
 fn tokenize_all(source: &str) -> Vec<Occurrence> {
     let mut out = Vec::new();
-    let bytes = source.as_bytes();
-    let mut i = 0usize;
     let mut line = 1u32;
     let mut line_start = 0usize;
+    let mut chars = source.char_indices().peekable();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    while let Some((i, c)) = chars.next() {
         if c == '\n' {
             line += 1;
-            line_start = i + 1;
-            i += 1;
+            line_start = i + c.len_utf8();
             continue;
         }
         if is_ident_start(c) {
             let start = i;
-            i += 1;
-            while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-                i += 1;
+            let mut end = i + c.len_utf8();
+            while let Some(&(ni, nc)) = chars.peek() {
+                if is_ident_continue(nc) {
+                    end = ni + nc.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-            let name = &source[start..i];
             let col = (start - line_start) as u32 + 1;
             out.push(Occurrence {
-                name: name.to_string(),
+                name: source[start..end].to_string(),
                 line,
                 col,
             });
             continue;
         }
-        i += 1;
     }
     out
 }
 
 fn tokenize_idents(source: &str) -> Vec<Occurrence> {
     let mut out = Vec::new();
-    let bytes = source.as_bytes();
-    let mut i = 0usize;
     let mut line = 1u32;
     let mut line_start = 0usize;
+    let mut chars = source.char_indices().peekable();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-
+    while let Some((i, c)) = chars.next() {
         if c == '\n' {
             line += 1;
-            line_start = i + 1;
-            i += 1;
+            line_start = i + c.len_utf8();
             continue;
         }
 
-        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-
-        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'\n' {
-                    line += 1;
-                    line_start = i + 1;
+        if c == '/' {
+            if let Some(&(_, '/')) = chars.peek() {
+                chars.next();
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc == '\n' {
+                        break;
+                    }
+                    chars.next();
                 }
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
+                continue;
             }
-            continue;
+            if let Some(&(_, '*')) = chars.peek() {
+                chars.next();
+                while let Some((ni, nc)) = chars.next() {
+                    if nc == '\n' {
+                        line += 1;
+                        line_start = ni + nc.len_utf8();
+                    }
+                    if nc == '*' {
+                        if let Some(&(_, '/')) = chars.peek() {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
         }
 
         // Text block """..."""
-        if c == '"' && i + 2 < bytes.len() && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
-            i += 3;
-            while i + 2 < bytes.len() {
-                if bytes[i] == b'\n' {
-                    line += 1;
-                    line_start = i + 1;
-                }
-                if bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
-                    i += 3;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-
         if c == '"' {
-            i += 1;
-            while i < bytes.len() {
-                let ch = bytes[i];
-                if ch == b'\\' {
-                    i += 2;
+            let is_text_block = matches!(chars.peek(), Some((_, '"')))
+                && ({
+                    let mut look = chars.clone();
+                    look.next();
+                    matches!(look.peek(), Some((_, '"')))
+                });
+            if is_text_block {
+                chars.next(); // second "
+                chars.next(); // third "
+                while let Some((ni, nc)) = chars.next() {
+                    if nc == '\n' {
+                        line += 1;
+                        line_start = ni + nc.len_utf8();
+                    }
+                    if nc == '"' {
+                        if let Some(&(_, '"')) = chars.peek() {
+                            let mut look = chars.clone();
+                            look.next();
+                            if matches!(look.peek(), Some((_, '"'))) {
+                                chars.next();
+                                chars.next();
+                                break;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            while let Some((ni, nc)) = chars.next() {
+                if nc == '\\' {
+                    chars.next();
                     continue;
                 }
-                if ch == b'\n' {
+                if nc == '\n' {
                     line += 1;
-                    line_start = i + 1;
-                    i += 1;
+                    line_start = ni + nc.len_utf8();
                     continue;
                 }
-                if ch == b'"' {
-                    i += 1;
+                if nc == '"' {
                     break;
                 }
-                i += 1;
             }
             continue;
         }
 
         if c == '\'' {
-            i += 1;
-            while i < bytes.len() {
-                let ch = bytes[i];
-                if ch == b'\\' {
-                    i += 2;
+            while let Some((ni, nc)) = chars.next() {
+                if nc == '\\' {
+                    chars.next();
                     continue;
                 }
-                if ch == b'\'' {
-                    i += 1;
+                if nc == '\'' {
                     break;
                 }
-                if ch == b'\n' {
+                if nc == '\n' {
                     line += 1;
-                    line_start = i + 1;
+                    line_start = ni + nc.len_utf8();
                 }
-                i += 1;
             }
             continue;
         }
 
         if is_ident_start(c) {
             let start = i;
-            i += 1;
-            while i < bytes.len() && is_ident_continue(bytes[i] as char) {
-                i += 1;
+            let mut end = i + c.len_utf8();
+            while let Some(&(ni, nc)) = chars.peek() {
+                if is_ident_continue(nc) {
+                    end = ni + nc.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-            let name = &source[start..i];
             let col = (start - line_start) as u32 + 1;
             out.push(Occurrence {
-                name: name.to_string(),
+                name: source[start..end].to_string(),
                 line,
                 col,
             });
             continue;
         }
-
-        i += 1;
     }
     out
 }
@@ -213,5 +222,15 @@ mod tests {
         let occs = tokenize(src, TokenMode::All);
         let count = occs.iter().filter(|o| o.name == "HttpClient").count();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn unicode_identifiers() {
+        let src = "class Café { int αβγ = 1; String 名前; }\n";
+        let occs = tokenize(src, TokenMode::Idents);
+        let names: Vec<_> = occs.iter().map(|o| o.name.as_str()).collect();
+        assert!(names.contains(&"Café"));
+        assert!(names.contains(&"αβγ"));
+        assert!(names.contains(&"名前"));
     }
 }

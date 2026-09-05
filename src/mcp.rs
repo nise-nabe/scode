@@ -147,7 +147,7 @@ impl ScodeMcp {
         let mut store = self.store.lock().await;
         store.insert_memory(&args.memory_id, index);
         if let Some(ref dir) = out {
-            let _ = store.load_path(dir);
+            store.load_path(dir).map_err(map_err)?;
         }
 
         text_ok(serde_json::json!({
