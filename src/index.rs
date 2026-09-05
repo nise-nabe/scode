@@ -279,8 +279,9 @@ pub fn build_index(
     fetch: bool,
     cache_dir: Option<&Path>,
     repository: Option<&str>,
+    local_repo: Option<&Path>,
 ) -> anyhow::Result<Index> {
-    let docs = corpus::load_docs(input, fetch, cache_dir, repository)?;
+    let docs = corpus::load_docs(input, fetch, cache_dir, repository, local_repo)?;
     build_from_docs(docs, token_mode)
 }
 
@@ -353,9 +354,17 @@ pub fn index_and_maybe_write(
     fetch: bool,
     cache_dir: Option<&Path>,
     repository: Option<&str>,
+    local_repo: Option<&Path>,
 ) -> anyhow::Result<Index> {
     let corpus = CorpusInput::detect(input);
-    let index = build_index(&corpus, token_mode, fetch, cache_dir, repository)?;
+    let index = build_index(
+        &corpus,
+        token_mode,
+        fetch,
+        cache_dir,
+        repository,
+        local_repo,
+    )?;
     if let Some(dir) = out {
         index.write_to_dir(dir)?;
     }

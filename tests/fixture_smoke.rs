@@ -8,7 +8,9 @@ use std::path::PathBuf;
 #[test]
 fn fixture_tree_idents_httpclient() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/demo");
-    let idx = build_index(&CorpusInput::detect(&root), TokenMode::Idents, false, None, None).unwrap();
+    let idx =
+        build_index(&CorpusInput::detect(&root), TokenMode::Idents, false, None, None, None)
+            .unwrap();
     let hits = idx.search("HttpClient", None);
     // Foo.java field + ctor param + Bar.java param = 3 (idents; comments/strings excluded)
     assert_eq!(hits.len(), 3, "hits={hits:?}");
@@ -21,7 +23,8 @@ fn fixture_tree_idents_httpclient() {
 #[test]
 fn fixture_tree_all_includes_comment_string() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/demo");
-    let idx = build_index(&CorpusInput::detect(&root), TokenMode::All, false, None, None).unwrap();
+    let idx =
+        build_index(&CorpusInput::detect(&root), TokenMode::All, false, None, None, None).unwrap();
     let hits = idx.search("HttpClient", None);
     // idents 3 + javadoc + line comment + string literal in Foo.java
     assert!(hits.len() >= 5, "expected all-mode to find comment/string hits, got {}", hits.len());

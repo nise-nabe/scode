@@ -1,4 +1,4 @@
-//! Corpus ingestion: source trees, frozen GAV TOML, optional Maven fetch.
+//! Corpus ingestion: source trees, frozen GAV TOML, local Maven/Gradle caches.
 
 use std::fs;
 use std::io::{Cursor, Read};
@@ -68,8 +68,9 @@ impl CorpusInput {
 
 #[derive(Debug, Deserialize)]
 struct FrozenFile {
-    /// Default Maven-layout repository base URL (no hardcoded host in scode).
-    /// Example: `https://repo1.maven.org/maven2`
+    /// Optional remote Maven-layout base URL for `--fetch` when the artifact is
+    /// not already in a local Maven/Gradle cache. Prefer local caches — the same
+    /// places Maven/Gradle write into after resolving their configured repos.
     #[serde(default)]
     repository: Option<String>,
     #[serde(default)]
@@ -81,10 +82,10 @@ pub struct GavEntry {
     pub group: String,
     pub artifact: String,
     pub version: String,
-    /// Per-artifact repository base URL override.
+    /// Per-artifact remote repository base URL (fetch only).
     #[serde(default)]
     pub repository: Option<String>,
-    /// Full URL to the `-sources.jar` (skips Maven-layout join).
+    /// Full URL to the `-sources.jar` (fetch only; skips Maven-layout join).
     #[serde(default)]
     pub sources_url: Option<String>,
 }
@@ -94,10 +95,17 @@ impl GavEntry {
         format!("{}:{}:{}", self.group, self.artifact, self.version)
     }
 
-    /// Resolve the sources jar URL.
+    /// Relative Maven-layout path under a local repository root.
+    pub fn maven_layout_sources_rel(&self) -> PathBuf {
+        PathBuf::from(self.group.replace('.', "/"))
+            .join(&self.artifact)
+            .join(&self.version)
+            .join(format!("{}-{}-sources.jar", self.artifact, self.version))
+    }
+
+    /// Resolve a remote sources URL for `--fetch` (not used for local cache hits).
     ///
-    /// Priority: `sources_url` → entry `repository` → `repo_override` (CLI/MCP)
-    /// → file-level `file_repository`. There is no built-in default host.
+    /// Priority: `sources_url` → entry `repository` → CLI/MCP override → file `repository`.
     pub fn resolve_sources_url(
         &self,
         file_repository: Option<&str>,
@@ -114,8 +122,9 @@ impl GavEntry {
             .or_else(|| file_repository.filter(|s| !s.is_empty()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no Maven repository for {}:{}:{} — set `repository` in the frozen TOML, \
-                     per-artifact `repository`/`sources_url`, or pass --repository",
+                    "no remote repository for {}:{}:{} — not found in local Maven/Gradle caches; \
+                     set TOML/CLI `repository`, per-artifact `sources_url`, or install the \
+                     sources jar into the local Maven repository",
                     self.group, self.artifact, self.version
                 )
             })?;
@@ -130,16 +139,111 @@ pub fn maven_sources_url(repository: &str, group: &str, artifact: &str, version:
     format!("{base}/{group_path}/{artifact}/{version}/{artifact}-{version}-sources.jar")
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Default local Maven repository (`$SCODE_LOCAL_REPO` / `$M2_REPO` / `~/.m2/repository`).
+pub fn default_maven_local_repo() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SCODE_LOCAL_REPO") {
+        return Some(PathBuf::from(p));
+    }
+    if let Ok(p) = std::env::var("M2_REPO") {
+        return Some(PathBuf::from(p));
+    }
+    Some(home_dir()?.join(".m2").join("repository"))
+}
+
+fn default_gradle_modules_cache() -> Option<PathBuf> {
+    Some(
+        home_dir()?
+            .join(".gradle")
+            .join("caches")
+            .join("modules-2")
+            .join("files-2.1"),
+    )
+}
+
+fn maven_layout_sources(local_repo: &Path, gav: &GavEntry) -> PathBuf {
+    local_repo.join(gav.maven_layout_sources_rel())
+}
+
+fn find_gradle_sources(gav: &GavEntry) -> Option<PathBuf> {
+    let base = default_gradle_modules_cache()?
+        .join(&gav.group)
+        .join(&gav.artifact)
+        .join(&gav.version);
+    if !base.is_dir() {
+        return None;
+    }
+    let needle = format!("{}-{}-sources.jar", gav.artifact, gav.version);
+    for entry in WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == needle)
+        {
+            return Some(path.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Locate a sources jar already on disk (Maven local / Gradle / scode download cache).
+pub fn find_local_sources_jar(
+    gav: &GavEntry,
+    local_repo: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(repo) = local_repo {
+        let p = maven_layout_sources(repo, gav);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(default_repo) = default_maven_local_repo() {
+        let already_tried = local_repo.is_some_and(|p| p == default_repo.as_path());
+        if !already_tried {
+            let p = maven_layout_sources(&default_repo, gav);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if let Some(p) = find_gradle_sources(gav) {
+        return Some(p);
+    }
+    if let Some(cache) = cache_dir {
+        let p = cache.join(format!(
+            "{}-{}-{}-sources.jar",
+            gav.group.replace('.', "_"),
+            gav.artifact,
+            gav.version
+        ));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Load all source documents from an input.
 pub fn load_docs(
     input: &CorpusInput,
     fetch: bool,
     cache_dir: Option<&Path>,
     repository: Option<&str>,
+    local_repo: Option<&Path>,
 ) -> anyhow::Result<Vec<SourceDoc>> {
     match input {
         CorpusInput::Tree(root) => load_tree(root, "local:tree:0"),
-        CorpusInput::FrozenGavs(toml_path) => load_frozen(toml_path, fetch, cache_dir, repository),
+        CorpusInput::FrozenGavs(toml_path) => {
+            load_frozen(toml_path, fetch, cache_dir, repository, local_repo)
+        }
     }
 }
 
@@ -192,6 +296,7 @@ fn load_frozen(
     fetch: bool,
     cache_dir: Option<&Path>,
     repository: Option<&str>,
+    local_repo: Option<&Path>,
 ) -> anyhow::Result<Vec<SourceDoc>> {
     let text = fs::read_to_string(toml_path)?;
     let file: FrozenFile = toml::from_str(&text)?;
@@ -211,22 +316,29 @@ fn load_frozen(
     let file_repo = file.repository.as_deref();
     let mut docs = Vec::new();
     for gav in &file.artifacts {
-        let jar_path = cache.join(format!(
-            "{}-{}-{}-sources.jar",
-            gav.group.replace('.', "_"),
-            gav.artifact,
-            gav.version
-        ));
-        if !jar_path.exists() {
-            if !fetch {
-                anyhow::bail!(
-                    "missing cached sources jar {} (pass --fetch to download)",
-                    jar_path.display()
-                );
-            }
+        let jar_path = if let Some(existing) =
+            find_local_sources_jar(gav, local_repo, Some(cache.as_path()))
+        {
+            existing
+        } else if fetch {
+            let dest = cache.join(format!(
+                "{}-{}-{}-sources.jar",
+                gav.group.replace('.', "_"),
+                gav.artifact,
+                gav.version
+            ));
             let url = gav.resolve_sources_url(file_repo, repository)?;
-            download_url(&url, &jar_path)?;
-        }
+            download_url(&url, &dest)?;
+            dest
+        } else {
+            anyhow::bail!(
+                "sources jar not found for {} in local Maven/Gradle caches \
+                 (tried --local-repo, ~/.m2/repository, Gradle modules cache, {}); \
+                 pass --fetch with a remote `repository`, or install sources into the local repo",
+                gav.coordinate(),
+                cache.display()
+            );
+        };
         docs.extend(load_sources_jar(&jar_path, &gav.coordinate())?);
     }
     Ok(docs)
@@ -246,60 +358,6 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     }
     fs::write(dest, bytes)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maven_url_join_trims_slash() {
-        let url = maven_sources_url(
-            "https://example.corp/maven2/",
-            "com.acme",
-            "lib",
-            "1.2.3",
-        );
-        assert_eq!(
-            url,
-            "https://example.corp/maven2/com/acme/lib/1.2.3/lib-1.2.3-sources.jar"
-        );
-    }
-
-    #[test]
-    fn resolve_prefers_sources_url_then_entry_repo() {
-        let mut gav = GavEntry {
-            group: "g".into(),
-            artifact: "a".into(),
-            version: "1".into(),
-            repository: Some("https://entry.example/m2".into()),
-            sources_url: Some("https://cdn.example/a-sources.jar".into()),
-        };
-        assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
-            "https://cdn.example/a-sources.jar"
-        );
-        gav.sources_url = None;
-        assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
-            "https://entry.example/m2/g/a/1/a-1-sources.jar"
-        );
-        gav.repository = None;
-        assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
-            "https://cli.example/m2/g/a/1/a-1-sources.jar"
-        );
-        assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), None)
-                .unwrap(),
-            "https://file.example/m2/g/a/1/a-1-sources.jar"
-        );
-        let err = gav.resolve_sources_url(None, None).unwrap_err().to_string();
-        assert!(err.contains("no Maven repository"), "{err}");
-    }
 }
 
 fn load_sources_jar(jar: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
@@ -361,4 +419,71 @@ pub fn load_sources_jar_bytes(bytes: &[u8], gav: &str) -> anyhow::Result<Vec<Sou
     }
     docs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(docs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maven_url_join_trims_slash() {
+        let url = maven_sources_url(
+            "https://example.corp/maven2/",
+            "com.acme",
+            "lib",
+            "1.2.3",
+        );
+        assert_eq!(
+            url,
+            "https://example.corp/maven2/com/acme/lib/1.2.3/lib-1.2.3-sources.jar"
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_sources_url_then_entry_repo() {
+        let mut gav = GavEntry {
+            group: "g".into(),
+            artifact: "a".into(),
+            version: "1".into(),
+            repository: Some("https://entry.example/m2".into()),
+            sources_url: Some("https://cdn.example/a-sources.jar".into()),
+        };
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://cdn.example/a-sources.jar"
+        );
+        gav.sources_url = None;
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://entry.example/m2/g/a/1/a-1-sources.jar"
+        );
+        gav.repository = None;
+        assert_eq!(
+            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
+                .unwrap(),
+            "https://cli.example/m2/g/a/1/a-1-sources.jar"
+        );
+        let err = gav.resolve_sources_url(None, None).unwrap_err().to_string();
+        assert!(err.contains("no remote repository"), "{err}");
+    }
+
+    #[test]
+    fn finds_jar_in_maven_local_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gav = GavEntry {
+            group: "com.acme".into(),
+            artifact: "lib".into(),
+            version: "1.0.0".into(),
+            repository: None,
+            sources_url: None,
+        };
+        let dest = maven_layout_sources(tmp.path(), &gav);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // minimal zip so is_file() is enough for finder; loader not called here
+        fs::write(&dest, b"pk\x03\x04").unwrap();
+        let found = find_local_sources_jar(&gav, Some(tmp.path()), None).unwrap();
+        assert_eq!(found, dest);
+    }
 }

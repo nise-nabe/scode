@@ -1,10 +1,11 @@
 # Tree H — Apache HttpClient 5.6.4 compile/runtime closure (from paper draft).
-# Use: scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
 #
-# `repository` is required for --fetch (scode has no built-in Maven host).
-# Override per run with --repository, or per artifact with repository/sources_url.
-
-repository = "https://repo1.maven.org/maven2"
+# Prefer jars already resolved by Maven/Gradle into the local cache:
+#   scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h
+#
+# Remote fetch is optional and only used when a sources jar is missing locally:
+#   scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch \
+#     --repository https://<your-mirror>/maven2
 
 [[artifacts]]
 group = "org.apache.httpcomponents.client5"

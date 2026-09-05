@@ -29,13 +29,16 @@ enum Command {
         /// Token mode
         #[arg(long, value_enum, default_value_t = TokenModeArg::Idents)]
         token_mode: TokenModeArg,
-        /// Download missing Maven sources jars
+        /// Download missing sources jars only when not already in a local Maven/Gradle cache
         #[arg(long, default_value_t = false)]
         fetch: bool,
-        /// Cache directory for downloaded jars
+        /// Cache directory for downloaded jars (scode download cache)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
-        /// Maven-layout repository base URL (overrides frozen TOML `repository`)
+        /// Local Maven repository root (default: $SCODE_LOCAL_REPO / $M2_REPO / ~/.m2/repository)
+        #[arg(long)]
+        local_repo: Option<PathBuf>,
+        /// Remote Maven-layout base URL for --fetch when the jar is not local
         #[arg(long)]
         repository: Option<String>,
     },
@@ -93,6 +96,7 @@ fn main() -> anyhow::Result<()> {
             token_mode,
             fetch,
             cache_dir,
+            local_repo,
             repository,
         } => {
             if backend != "delta" {
@@ -105,6 +109,7 @@ fn main() -> anyhow::Result<()> {
                 fetch,
                 cache_dir.as_deref(),
                 repository.as_deref(),
+                local_repo.as_deref(),
             )?;
             let stats = index.stats();
             eprintln!(

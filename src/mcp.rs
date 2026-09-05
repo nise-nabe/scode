@@ -45,7 +45,7 @@ pub struct IndexArgs {
     /// Token mode: idents (default) or all
     #[serde(default = "default_token_mode")]
     pub token_mode: String,
-    /// Fetch missing Maven sources jars
+    /// Fetch missing sources jars only when not already in a local Maven/Gradle cache
     #[serde(default)]
     pub fetch: bool,
     /// Memory slot id (default)
@@ -54,7 +54,10 @@ pub struct IndexArgs {
     /// Optional cache dir for downloaded jars
     #[serde(default)]
     pub cache_dir: Option<String>,
-    /// Maven-layout repository base URL (overrides frozen TOML `repository`)
+    /// Local Maven repository root (default: $SCODE_LOCAL_REPO / $M2_REPO / ~/.m2/repository)
+    #[serde(default)]
+    pub local_repo: Option<String>,
+    /// Remote Maven-layout base URL for fetch when the jar is not local
     #[serde(default)]
     pub repository: Option<String>,
 }
@@ -128,6 +131,7 @@ impl ScodeMcp {
         let mode = TokenMode::parse(&args.token_mode).map_err(map_err)?;
         let out = args.out.as_ref().map(PathBuf::from);
         let cache = args.cache_dir.as_ref().map(PathBuf::from);
+        let local_repo = args.local_repo.as_ref().map(PathBuf::from);
         let index = index_and_maybe_write(
             Path::new(&args.input),
             out.as_deref(),
@@ -135,6 +139,7 @@ impl ScodeMcp {
             args.fetch,
             cache.as_deref(),
             args.repository.as_deref(),
+            local_repo.as_deref(),
         )
         .map_err(map_err)?;
 

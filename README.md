@@ -27,9 +27,11 @@ scode search-multi --index /tmp/scode-demo -q HttpClient -q Foo --json
 # Wider tokens (comments/strings included; closer to rg word-boundary identity)
 scode index --input fixtures/demo --out /tmp/scode-all --token-mode all
 
-# Frozen GAV list (downloads sources jars with --fetch).
-# Repository URL comes from the TOML `repository` field, or --repository.
-scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
+# Frozen GAV list — prefers jars already in local Maven/Gradle caches
+# (~/.m2/repository, $M2_REPO, Gradle modules cache). No remote host required.
+scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h
+
+# Optional: fetch only what is missing, using a repo Maven/Gradle would use
 # scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch \
 #   --repository https://my.mirror/maven2
 ```
@@ -41,16 +43,19 @@ scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
 | `idents` (default) | Java/Kotlin identifiers in code only |
 | `all` | Identifier-shaped tokens across the whole file |
 
-### Frozen GAV repository
+### GAV resolution (Maven/Gradle local first)
 
-scode does **not** hardcode a Maven host. For `--fetch`, set one of:
+Frozen GAV indexing looks for `*-sources.jar` where Maven/Gradle already put them:
 
-1. Top-level `repository` in the frozen TOML
-2. Per-artifact `repository` or `sources_url`
-3. CLI/MCP `--repository` / `repository` (overrides the file default)
+1. `--local-repo` / `$SCODE_LOCAL_REPO` / `$M2_REPO` / `~/.m2/repository` (Maven layout)
+2. `~/.gradle/caches/modules-2/files-2.1/...` (Gradle module cache)
+3. scode download cache (`.scode-cache`)
+
+Remote URLs (`repository` / `sources_url` / `--repository`) are only needed with `--fetch` when the jar is not already local. scode does not hardcode Maven Central.
 
 ```toml
-repository = "https://repo1.maven.org/maven2"
+# repository is optional — only for --fetch of missing jars
+# repository = "https://my.mirror/maven2"
 
 [[artifacts]]
 group = "com.acme"
