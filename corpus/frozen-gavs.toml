@@ -1,0 +1,22 @@
+# Tree H — Apache HttpClient 5.6.4 compile/runtime closure (from paper draft).
+# Use: scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h --fetch
+
+[[artifacts]]
+group = "org.apache.httpcomponents.client5"
+artifact = "httpclient5"
+version = "5.6.4"
+
+[[artifacts]]
+group = "org.apache.httpcomponents.core5"
+artifact = "httpcore5"
+version = "5.4.3"
+
+[[artifacts]]
+group = "org.apache.httpcomponents.core5"
+artifact = "httpcore5-h2"
+version = "5.4.3"
+
+[[artifacts]]
+group = "org.slf4j"
+artifact = "slf4j-api"
+version = "1.7.36"

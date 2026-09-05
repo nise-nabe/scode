@@ -1,0 +1,28 @@
+[package]
+name = "scode"
+version = "0.1.0"
+edition = "2021"
+description = "Compressed inverted-index name locate over Maven sources keep-sets"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "scode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+rmcp = { version = "0.8", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
