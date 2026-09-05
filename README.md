@@ -84,10 +84,6 @@ CLI remains **disk-only**; memory-only indexes are MCP-session scoped (gone on p
 | `index` | Build / persist / locate / search-multi |
 | `mcp` | stdio MCP server |
 
-## Out of scope (this repo)
-
-Wavelet-matrix baselines, PEF/PFor codec experiments, precise JVM-descriptor alignment, jdtls Mode P harnesses.
-
 ## License
 
 MIT
