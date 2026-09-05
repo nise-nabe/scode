@@ -1,7 +1,7 @@
 [package]
 name = "scode"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Compressed inverted-index name locate over Maven sources keep-sets"
 license = "MIT"
 readme = "README.md"
