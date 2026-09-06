@@ -278,18 +278,16 @@ pub fn decode_occurrences(
     if count == 0 {
         return Ok(Vec::new());
     }
+    // Always validate the stored posting length, even when early-exiting with a limit.
+    let max_bits = bytes.len().saturating_mul(8);
+    if count > max_bits {
+        anyhow::bail!("occurrence count {count} exceeds bitstream capacity ({max_bits} bits)");
+    }
     let decode_count = match limit {
         Some(0) => return Ok(Vec::new()),
         Some(l) => l.min(count),
         None => count,
     };
-    // Each occurrence needs at least one flag bit plus two Elias-δ values.
-    let max_bits = bytes.len().saturating_mul(8);
-    if decode_count > max_bits {
-        anyhow::bail!(
-            "occurrence decode count {decode_count} exceeds bitstream capacity ({max_bits} bits)"
-        );
-    }
     let mut r = BitReader::new(bytes);
     let mut out = Vec::with_capacity(decode_count);
     let mut doc_id = 0u32;
@@ -426,6 +424,11 @@ mod tests {
     #[test]
     fn occurrence_decode_rejects_huge_count() {
         assert!(decode_occurrences(&[0xff], 10_000, None).is_err());
+    }
+
+    #[test]
+    fn occurrence_decode_rejects_huge_count_with_small_limit() {
+        assert!(decode_occurrences(&[0xff], 10_000, Some(1)).is_err());
     }
 
     #[test]
