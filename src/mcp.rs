@@ -11,7 +11,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::corpus::TokenMode;
+use crate::corpus::{LoadOptions, TokenMode};
 use crate::index::{index_and_maybe_write, MemoryStore};
 
 #[derive(Clone)]
@@ -129,31 +129,43 @@ impl ScodeMcp {
         Parameters(args): Parameters<IndexArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mode = TokenMode::parse(&args.token_mode).map_err(map_err)?;
+        let input = PathBuf::from(&args.input);
         let out = args.out.as_ref().map(PathBuf::from);
+        let out_for_store = out.clone();
         let cache = args.cache_dir.as_ref().map(PathBuf::from);
         let local_repo = args.local_repo.as_ref().map(PathBuf::from);
-        let index = index_and_maybe_write(
-            Path::new(&args.input),
-            out.as_deref(),
-            mode,
-            args.fetch,
-            cache.as_deref(),
-            args.repository.as_deref(),
-            local_repo.as_deref(),
-        )
+        let repository = args.repository.clone();
+        let fetch = args.fetch;
+        let memory_id = args.memory_id.clone();
+
+        let index = tokio::task::spawn_blocking(move || {
+            index_and_maybe_write(
+                &input,
+                out.as_deref(),
+                mode,
+                LoadOptions {
+                    fetch,
+                    cache_dir: cache.as_deref(),
+                    repository: repository.as_deref(),
+                    local_repo: local_repo.as_deref(),
+                },
+            )
+        })
+        .await
+        .map_err(|e| map_err(anyhow::anyhow!("index task join: {e}")))?
         .map_err(map_err)?;
 
         let stats = index.stats();
         let mut store = self.store.lock().await;
-        let arc = store.insert_memory(&args.memory_id, index);
-        if let Some(ref dir) = out {
+        let arc = store.insert_memory(&memory_id, index);
+        if let Some(ref dir) = out_for_store {
             store.insert_path(dir, arc);
         }
 
         text_ok(serde_json::json!({
             "ok": true,
-            "memory_id": args.memory_id,
-            "persisted": out.is_some(),
+            "memory_id": memory_id,
+            "persisted": out_for_store.is_some(),
             "stats": stats,
         }))
     }

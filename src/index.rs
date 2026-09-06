@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::{self, CorpusInput, SourceDoc, TokenMode};
+use crate::corpus::{self, CorpusInput, LoadOptions, SourceDoc, TokenMode};
 use crate::delta::{decode_gaps, encode_gaps};
 use crate::intern::Dictionary;
 use crate::lex::Occurrence;
@@ -287,12 +287,9 @@ fn unpack_postings(mut data: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, u32)>> {
 pub fn build_index(
     input: &CorpusInput,
     token_mode: TokenMode,
-    fetch: bool,
-    cache_dir: Option<&Path>,
-    repository: Option<&str>,
-    local_repo: Option<&Path>,
+    opts: LoadOptions<'_>,
 ) -> anyhow::Result<Index> {
-    let docs = corpus::load_docs(input, fetch, cache_dir, repository, local_repo)?;
+    let docs = corpus::load_docs(input, opts)?;
     build_from_docs(docs, token_mode)
 }
 
@@ -362,20 +359,10 @@ pub fn index_and_maybe_write(
     input: &Path,
     out: Option<&Path>,
     token_mode: TokenMode,
-    fetch: bool,
-    cache_dir: Option<&Path>,
-    repository: Option<&str>,
-    local_repo: Option<&Path>,
+    opts: LoadOptions<'_>,
 ) -> anyhow::Result<Index> {
     let corpus = CorpusInput::detect(input);
-    let index = build_index(
-        &corpus,
-        token_mode,
-        fetch,
-        cache_dir,
-        repository,
-        local_repo,
-    )?;
+    let index = build_index(&corpus, token_mode, opts)?;
     if let Some(dir) = out {
         index.write_to_dir(dir)?;
     }

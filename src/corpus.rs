@@ -1,7 +1,7 @@
 //! Corpus ingestion: source trees, frozen GAV TOML, local Maven/Gradle caches.
 
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -91,9 +91,57 @@ pub struct GavEntry {
     pub sources_url: Option<String>,
 }
 
+/// Shared corpus-load knobs for CLI and MCP.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions<'a> {
+    pub fetch: bool,
+    pub cache_dir: Option<&'a Path>,
+    pub repository: Option<&'a str>,
+    pub local_repo: Option<&'a Path>,
+}
+
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_JAR_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+fn validate_gav_segment(kind: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{kind} must not be empty");
+    }
+    if value == "." || value == ".." {
+        anyhow::bail!("{kind} `{value}` is not allowed");
+    }
+    if value.contains(['/', '\\', '\0']) {
+        anyhow::bail!("{kind} `{value}` contains forbidden path characters");
+    }
+    Ok(())
+}
+
 impl GavEntry {
     pub fn coordinate(&self) -> String {
         format!("{}:{}:{}", self.group, self.artifact, self.version)
+    }
+
+    /// Reject GAV fields that could escape cache/repo roots via path join.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.group.is_empty() {
+            anyhow::bail!("group must not be empty");
+        }
+        for part in self.group.split('.') {
+            validate_gav_segment("group", part)?;
+        }
+        validate_gav_segment("artifact", &self.artifact)?;
+        validate_gav_segment("version", &self.version)?;
+        Ok(())
+    }
+
+    /// Single-component cache filename (safe after [`Self::validate`]).
+    pub fn cache_jar_name(&self) -> String {
+        format!(
+            "{}-{}-{}-sources.jar",
+            self.group.replace('.', "_"),
+            self.artifact,
+            self.version
+        )
     }
 
     /// Relative Maven-layout path under a local repository root.
@@ -219,12 +267,7 @@ pub fn find_local_sources_jar(
         return Some(p);
     }
     if let Some(cache) = cache_dir {
-        let p = cache.join(format!(
-            "{}-{}-{}-sources.jar",
-            gav.group.replace('.', "_"),
-            gav.artifact,
-            gav.version
-        ));
+        let p = cache.join(gav.cache_jar_name());
         if p.is_file() {
             return Some(p);
         }
@@ -233,18 +276,10 @@ pub fn find_local_sources_jar(
 }
 
 /// Load all source documents from an input.
-pub fn load_docs(
-    input: &CorpusInput,
-    fetch: bool,
-    cache_dir: Option<&Path>,
-    repository: Option<&str>,
-    local_repo: Option<&Path>,
-) -> anyhow::Result<Vec<SourceDoc>> {
+pub fn load_docs(input: &CorpusInput, opts: LoadOptions<'_>) -> anyhow::Result<Vec<SourceDoc>> {
     match input {
         CorpusInput::Tree(root) => load_tree(root, "local:tree:0"),
-        CorpusInput::FrozenGavs(toml_path) => {
-            load_frozen(toml_path, fetch, cache_dir, repository, local_repo)
-        }
+        CorpusInput::FrozenGavs(toml_path) => load_frozen(toml_path, opts),
     }
 }
 
@@ -298,19 +333,14 @@ fn load_tree(root: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
     Ok(docs)
 }
 
-fn load_frozen(
-    toml_path: &Path,
-    fetch: bool,
-    cache_dir: Option<&Path>,
-    repository: Option<&str>,
-    local_repo: Option<&Path>,
-) -> anyhow::Result<Vec<SourceDoc>> {
+fn load_frozen(toml_path: &Path, opts: LoadOptions<'_>) -> anyhow::Result<Vec<SourceDoc>> {
     let text = fs::read_to_string(toml_path)?;
     let file: FrozenFile = toml::from_str(&text)?;
     if file.artifacts.is_empty() {
         anyhow::bail!("no [[artifacts]] in {}", toml_path.display());
     }
-    let cache = cache_dir
+    let cache = opts
+        .cache_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| {
             toml_path
@@ -323,18 +353,14 @@ fn load_frozen(
     let file_repo = file.repository.as_deref();
     let mut docs = Vec::new();
     for gav in &file.artifacts {
+        gav.validate()?;
         let jar_path = if let Some(existing) =
-            find_local_sources_jar(gav, local_repo, Some(cache.as_path()))
+            find_local_sources_jar(gav, opts.local_repo, Some(cache.as_path()))
         {
             existing
-        } else if fetch {
-            let dest = cache.join(format!(
-                "{}-{}-{}-sources.jar",
-                gav.group.replace('.', "_"),
-                gav.artifact,
-                gav.version
-            ));
-            let url = gav.resolve_sources_url(file_repo, repository)?;
+        } else if opts.fetch {
+            let dest = cache.join(gav.cache_jar_name());
+            let url = gav.resolve_sources_url(file_repo, opts.repository)?;
             download_url(&url, &dest)?;
             dest
         } else {
@@ -349,6 +375,29 @@ fn load_frozen(
         docs.extend(load_sources_jar(&jar_path, &gav.coordinate())?);
     }
     Ok(docs)
+}
+
+fn copy_with_limit(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    limit: u64,
+) -> anyhow::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total
+            .checked_add(n as u64)
+            .ok_or_else(|| anyhow::anyhow!("transfer size overflow"))?;
+        if total > limit {
+            anyhow::bail!("transfer exceeded size limit ({limit} bytes)");
+        }
+        writer.write_all(&buf[..n])?;
+    }
+    Ok(total)
 }
 
 fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
@@ -371,7 +420,7 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp)
             .map_err(|e| anyhow::anyhow!("create {}: {e}", tmp.display()))?;
         let mut reader = resp.into_reader();
-        io::copy(&mut reader, &mut file)
+        copy_with_limit(&mut reader, &mut file, MAX_DOWNLOAD_BYTES)
             .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
         file.sync_all()
             .map_err(|e| anyhow::anyhow!("sync {}: {e}", tmp.display()))?;
@@ -397,10 +446,22 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
 
 fn load_sources_jar(jar: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
     let file = fs::File::open(jar)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    load_sources_jar_reader(file, gav)
+}
+
+/// Extract sources from jar bytes (tests / helpers).
+pub fn load_sources_jar_bytes(bytes: &[u8], gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
+    load_sources_jar_reader(Cursor::new(bytes), gav)
+}
+
+fn load_sources_jar_reader<R: Read + io::Seek>(
+    reader: R,
+    gav: &str,
+) -> anyhow::Result<Vec<SourceDoc>> {
+    let mut archive = zip::ZipArchive::new(reader)?;
     let mut docs = Vec::new();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         let name = entry.name().to_string();
         if entry.is_dir() {
             continue;
@@ -408,8 +469,21 @@ fn load_sources_jar(jar: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
         if !is_source_file(Path::new(&name)) {
             continue;
         }
+        if entry.size() > MAX_JAR_ENTRY_BYTES {
+            anyhow::bail!(
+                "jar entry `{name}` is too large ({} bytes; limit {MAX_JAR_ENTRY_BYTES})",
+                entry.size()
+            );
+        }
         let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
+        entry
+            .take(MAX_JAR_ENTRY_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_JAR_ENTRY_BYTES {
+            anyhow::bail!(
+                "jar entry `{name}` exceeded size limit ({MAX_JAR_ENTRY_BYTES} bytes)"
+            );
+        }
         let Ok(text) = String::from_utf8(buf) else {
             continue;
         };
@@ -426,34 +500,6 @@ fn load_sources_jar(jar: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
 /// Extract occurrences for a document.
 pub fn occurrences_for(doc: &SourceDoc, mode: TokenMode) -> Vec<Occurrence> {
     lex::tokenize(&doc.text, mode)
-}
-
-/// Load sources from jar bytes (tests / helpers).
-pub fn load_sources_jar_bytes(bytes: &[u8], gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-    let mut docs = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_string();
-        if entry.is_dir() {
-            continue;
-        }
-        if !is_source_file(Path::new(&name)) {
-            continue;
-        }
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        let Ok(text) = String::from_utf8(buf) else {
-            continue;
-        };
-        docs.push(SourceDoc {
-            gav: gav.to_string(),
-            path: name.replace('\\', "/"),
-            text,
-        });
-    }
-    docs.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(docs)
 }
 
 #[cfg(test)]
@@ -520,5 +566,27 @@ mod tests {
         fs::write(&dest, b"pk\x03\x04").unwrap();
         let found = find_local_sources_jar(&gav, Some(tmp.path()), None).unwrap();
         assert_eq!(found, dest);
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_gav() {
+        let bad = GavEntry {
+            group: "com.acme".into(),
+            artifact: "x/../../evil".into(),
+            version: "1.0".into(),
+            repository: None,
+            sources_url: None,
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("forbidden") || err.contains("path"), "{err}");
+
+        let bad_group = GavEntry {
+            group: "com/../evil".into(),
+            artifact: "lib".into(),
+            version: "1".into(),
+            repository: None,
+            sources_url: None,
+        };
+        assert!(bad_group.validate().is_err());
     }
 }

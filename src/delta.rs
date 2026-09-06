@@ -93,7 +93,8 @@ impl<'a> BitReader<'a> {
                 break;
             }
             len_l += 1;
-            if len_l > 64 {
+            // `1u64 << 64` overflows; legitimate Elias-δ never needs len_l >= 64.
+            if len_l >= 64 {
                 return None;
             }
         }
@@ -143,6 +144,13 @@ pub fn encode_gaps(positions: &[u32]) -> Vec<u8> {
 pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
     if count == 0 {
         return Ok(Vec::new());
+    }
+    // Each Elias-δ value needs ≥1 bit; reject absurd counts before allocating.
+    let max_bits = bytes.len().saturating_mul(8);
+    if count > max_bits {
+        anyhow::bail!(
+            "posting count {count} exceeds bitstream capacity ({max_bits} bits)"
+        );
     }
     let mut r = BitReader::new(bytes);
     let mut out = Vec::with_capacity(count);
@@ -213,6 +221,24 @@ mod tests {
         w.write_delta(u64::from(u32::MAX) + 2); // first gap = pos+1
         let enc = w.finish();
         assert!(decode_gaps(&enc, 1).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_huge_count() {
+        assert!(decode_gaps(&[0xff], 10_000).is_err());
+    }
+
+    #[test]
+    fn read_delta_rejects_len_l_64() {
+        // Elias-δ length unary of 64 zeros would make 1u64<<64; must error.
+        let mut w = BitWriter::new();
+        for _ in 0..64 {
+            w.write_bit(false);
+        }
+        w.write_bit(true); // would terminate unary if we allowed it
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_delta(), None);
     }
 
     #[test]

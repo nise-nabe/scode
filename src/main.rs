@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use scode::corpus::TokenMode;
+use scode::corpus::{LoadOptions, TokenMode};
 use scode::index::{index_and_maybe_write, Index};
 
 #[derive(Debug, Parser)]
@@ -106,10 +106,12 @@ fn main() -> anyhow::Result<()> {
                 &input,
                 Some(&out),
                 token_mode.into(),
-                fetch,
-                cache_dir.as_deref(),
-                repository.as_deref(),
-                local_repo.as_deref(),
+                LoadOptions {
+                    fetch,
+                    cache_dir: cache_dir.as_deref(),
+                    repository: repository.as_deref(),
+                    local_repo: local_repo.as_deref(),
+                },
             )?;
             let stats = index.stats();
             eprintln!(
