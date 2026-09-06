@@ -373,12 +373,23 @@ fn copy_with_limit(
     Ok(total)
 }
 
+/// Redact userinfo from URLs before logging (best-effort, no extra deps).
+fn redact_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
         anyhow::bail!("refusing non-http(s) download URL: {url}");
     }
-    eprintln!("fetching {url}");
+    eprintln!("fetching {}", redact_url(url));
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }

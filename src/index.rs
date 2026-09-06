@@ -102,6 +102,9 @@ impl Index {
     }
 
     pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<Hit>> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let Some(id) = self.dict.lookup(query) else {
             return Ok(Vec::new());
         };
@@ -543,17 +546,21 @@ impl MemoryStore {
     }
 
     /// Return a cached index without touching disk.
+    /// Precedence for named targets: memory slot → loaded path (matches `resolve`).
     pub fn peek(&self, index_arg: Option<&str>) -> Option<Arc<Index>> {
         match index_arg {
             None | Some("") | Some("memory") => self.get_memory("default"),
-            Some(p) => {
+            Some(p) => self.get_memory(p).or_else(|| {
                 let key = Path::new(p).to_string_lossy().into_owned();
-                self.path_map
-                    .get(&key)
-                    .cloned()
-                    .or_else(|| self.get_memory(p))
-            }
+                self.path_map.get(&key).cloned()
+            }),
         }
+    }
+
+    /// Return a previously loaded disk path without consulting memory slots.
+    pub fn get_loaded_path(&self, path: &Path) -> Option<Arc<Index>> {
+        let key = path.to_string_lossy().into_owned();
+        self.path_map.get(&key).cloned()
     }
 
     /// Insert a disk-loaded index, returning any racing winner already present.
@@ -694,6 +701,46 @@ mod tests {
         assert!(store.get_memory(&key).is_some());
         // Should not attempt to load the empty directory as an index.
         assert_eq!(got.stats().docs, 1);
+    }
+
+    #[test]
+    fn peek_and_resolve_prefer_memory_over_loaded_path() {
+        let mem_docs = vec![SourceDoc {
+            gav: "mem:lib:1".into(),
+            path: "Mem.java".into(),
+            text: "class MemOnly {}".into(),
+        }];
+        let path_docs = vec![SourceDoc {
+            gav: "path:lib:1".into(),
+            path: "Path.java".into(),
+            text: "class PathOnly {}".into(),
+        }];
+        let mem_idx = build_from_docs(mem_docs, TokenMode::Idents).unwrap();
+        let path_idx = build_from_docs(path_docs, TokenMode::Idents).unwrap();
+        let mut store = MemoryStore::new();
+        let key = "idx";
+        store.insert_memory(key, mem_idx);
+        store.insert_path(Path::new(key), Arc::new(path_idx));
+        let peeked = store.peek(Some(key)).unwrap();
+        assert_eq!(peeked.search("MemOnly", None).unwrap().len(), 1);
+        assert!(peeked.search("PathOnly", None).unwrap().is_empty());
+        let resolved = store.resolve(Some(key)).unwrap();
+        assert_eq!(resolved.search("MemOnly", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_limit_zero_returns_empty() {
+        let docs = vec![SourceDoc {
+            gav: "demo:lib:1".into(),
+            path: "Foo.java".into(),
+            text: "class Foo { HttpClient c; }".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        assert!(idx.search("HttpClient", Some(0)).unwrap().is_empty());
+        let multi = idx
+            .search_multi(&["HttpClient".into()], Some(0), Some(0))
+            .unwrap();
+        assert!(multi.hits.is_empty());
     }
 
     #[test]

@@ -197,7 +197,7 @@ impl ScodeMcp {
         let local_repo = args.local_repo.as_ref().map(PathBuf::from);
         let repository = args.repository.clone();
         let fetch = args.fetch;
-        let memory_id = args.memory_id.clone();
+        let memory_id = args.memory_id.trim().to_string();
         validate_memory_id(&memory_id).map_err(map_err)?;
 
         let index = tokio::task::spawn_blocking(move || {
@@ -248,18 +248,8 @@ impl ScodeMcp {
             let store = self.store.lock().await;
             match args.index.as_deref() {
                 None | Some("") | Some("memory") => true,
-                Some(p) => {
-                    let path = Path::new(p);
-                    // Prefer store state over filesystem so memory ids that look like
-                    // paths (or collide with real paths) report correctly.
-                    if store.has_loaded_path(path) {
-                        false
-                    } else if store.get_memory(p).is_some() {
-                        true
-                    } else {
-                        !path.exists()
-                    }
-                }
+                // Same precedence as peek/resolve: memory slot wins over a loaded path.
+                Some(p) => store.get_memory(p).is_some(),
             }
         };
         text_ok(serde_json::json!({
@@ -309,7 +299,8 @@ impl ScodeMcp {
         let path = PathBuf::from(&args.path);
         {
             let store = self.store.lock().await;
-            if let Some(idx) = store.peek(Some(path.to_str().unwrap_or(args.path.as_str()))) {
+            // Path loads must not short-circuit onto a colliding memory slot id.
+            if let Some(idx) = store.get_loaded_path(&path) {
                 return text_ok(serde_json::json!({
                     "ok": true,
                     "path": args.path,
@@ -341,14 +332,15 @@ impl ScodeMcp {
         let path = Path::new(target);
         let path_exists = target != "memory" && path.exists();
         let mut store = self.store.lock().await;
-        // Same precedence as resolve/peek: loaded path → memory slot → on-disk path.
+        // Same precedence as peek/resolve: memory slot → loaded path → on-disk path.
         let removed = if target == "memory" {
             store.unload_memory("default")
-        } else if store.has_loaded_path(path) {
-            store.unload_path(path)
         } else if store.get_memory(target).is_some() {
             store.unload_memory(target)
+        } else if store.has_loaded_path(path) {
+            store.unload_path(path)
         } else if path_exists {
+            // Not loaded in-session; unload_path is a no-op but keeps the API honest.
             store.unload_path(path)
         } else {
             store.unload_memory(target)
