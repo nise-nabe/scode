@@ -213,6 +213,11 @@ pub fn decode_occurrences(bytes: &[u8], count: usize) -> anyhow::Result<Vec<OccP
     if count == 0 {
         return Ok(Vec::new());
     }
+    // Each occurrence needs at least one flag bit plus two Elias-δ values.
+    let max_bits = bytes.len().saturating_mul(8);
+    if count > max_bits {
+        anyhow::bail!("occurrence count {count} exceeds bitstream capacity ({max_bits} bits)");
+    }
     let mut r = BitReader::new(bytes);
     let mut out = Vec::with_capacity(count);
     let mut doc_id = 0u32;
@@ -220,6 +225,9 @@ pub fn decode_occurrences(bytes: &[u8], count: usize) -> anyhow::Result<Vec<OccP
         let same_doc = r
             .read_bit()
             .ok_or_else(|| anyhow::anyhow!("truncated occurrence posting"))?;
+        if i == 0 && same_doc {
+            anyhow::bail!("invalid occurrence posting: first entry cannot set same_doc");
+        }
         if !same_doc {
             let gap_u64 = r
                 .read_delta()
@@ -381,6 +389,21 @@ mod tests {
         let enc = encode_occurrences(&occs);
         let dec = decode_occurrences(&enc, occs.len()).unwrap();
         assert_eq!(dec, occs);
+    }
+
+    #[test]
+    fn occurrence_decode_rejects_huge_count() {
+        assert!(decode_occurrences(&[0xff], 10_000).is_err());
+    }
+
+    #[test]
+    fn occurrence_decode_rejects_same_doc_on_first_entry() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // invalid: same_doc on first entry
+        w.write_delta(1);
+        w.write_delta(1);
+        let enc = w.finish();
+        assert!(decode_occurrences(&enc, 1).is_err());
     }
 
     #[test]

@@ -281,6 +281,12 @@ pub struct SearchMultiResult {
 }
 
 const INDEX_FILES: &[&str] = &["manifest.json", "dict.bin", "docs.json", "postings.bin"];
+/// v1 artifact; still allowed when replacing an existing index directory in place.
+const LEGACY_INDEX_FILES: &[&str] = &["occs.bin"];
+
+fn is_known_index_file(name: &str) -> bool {
+    INDEX_FILES.contains(&name) || LEGACY_INDEX_FILES.contains(&name)
+}
 
 /// Allow replace only for empty dirs or dirs that already look like an scode index.
 /// Prevents accidentally wiping unrelated files under `--out`.
@@ -300,12 +306,12 @@ fn ensure_replaceable_index_dir(dir: &Path) -> anyhow::Result<()> {
                 dir.display()
             );
         };
-        if !INDEX_FILES.contains(&name) {
+        if !is_known_index_file(name) {
             anyhow::bail!(
                 "refusing to replace {}: contains non-index entry `{name}` \
                  (expected only {}); use an empty directory or an existing scode index",
                 dir.display(),
-                INDEX_FILES.join(", ")
+                [INDEX_FILES, LEGACY_INDEX_FILES].concat().join(", ")
             );
         }
         let ft = entry.file_type()?;
@@ -697,6 +703,38 @@ mod tests {
         let loaded = Index::open_dir(dir.path()).unwrap();
         assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
         assert_eq!(loaded.stats().names, idx.stats().names);
+    }
+
+    #[test]
+    fn replaces_legacy_v1_index_dir_with_occs_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            backend: "delta".into(),
+            token_mode: TokenMode::Idents,
+            doc_count: 0,
+            name_count: 0,
+            occurrence_count: 0,
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("dict.bin"), b"").unwrap();
+        fs::write(dir.path().join("docs.json"), b"[]").unwrap();
+        fs::write(dir.path().join("occs.bin"), b"legacy").unwrap();
+        fs::write(dir.path().join("postings.bin"), [0u8, 0, 0, 0]).unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "X.java".into(),
+            text: "class X { Bar b; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        idx.write_to_dir(dir.path()).unwrap();
+        assert!(!dir.path().join("occs.bin").exists());
+        let loaded = Index::open_dir(dir.path()).unwrap();
+        assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
     }
 
     #[test]
