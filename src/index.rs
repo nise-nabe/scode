@@ -1,10 +1,11 @@
 //! Index build, persistence, and name locate.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +47,7 @@ impl Hit {
 }
 
 /// On-disk index format version (bumped when layout changes).
-pub const INDEX_FORMAT_VERSION: u32 = 2;
+pub const INDEX_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -76,19 +77,79 @@ struct DocMeta {
     path: String,
 }
 
+/// Offset-table entry for one name's posting list (v3 `postings.bin`).
+#[derive(Debug, Clone, Copy)]
+struct PostingMeta {
+    count: u32,
+    offset: u32,
+    len: u32,
+}
+
+/// Posting storage: in-memory after build, mmap-backed after `open_dir`.
+#[derive(Debug, Clone)]
+enum Postings {
+    InMemory(Vec<(Vec<u8>, u32)>),
+    Mmap {
+        mmap: Arc<Mmap>,
+        meta: Vec<PostingMeta>,
+        data_base: u32,
+    },
+}
+
+impl Postings {
+    fn len(&self) -> usize {
+        match self {
+            Self::InMemory(v) => v.len(),
+            Self::Mmap { meta, .. } => meta.len(),
+        }
+    }
+
+    fn get(&self, id: usize) -> anyhow::Result<(&[u8], u32)> {
+        match self {
+            Self::InMemory(v) => {
+                let (blob, count) = v.get(id).ok_or_else(|| {
+                    anyhow::anyhow!("corrupt index: name id {id} missing from postings")
+                })?;
+                Ok((blob.as_slice(), *count))
+            }
+            Self::Mmap {
+                mmap,
+                meta,
+                data_base,
+            } => {
+                let entry = meta.get(id).ok_or_else(|| {
+                    anyhow::anyhow!("corrupt index: name id {id} missing from postings")
+                })?;
+                let start = *data_base as usize + entry.offset as usize;
+                let end = start + entry.len as usize;
+                if end > mmap.len() {
+                    anyhow::bail!("corrupt postings: name id {id} blob out of range");
+                }
+                Ok((&mmap[start..end], entry.count))
+            }
+        }
+    }
+
+    fn posting_bytes(&self) -> usize {
+        match self {
+            Self::InMemory(v) => v.iter().map(|(b, _)| b.len()).sum(),
+            Self::Mmap { meta, .. } => meta.iter().map(|m| m.len as usize).sum(),
+        }
+    }
+}
+
 /// In-memory / on-disk inverted index.
 #[derive(Debug, Clone)]
 pub struct Index {
     pub manifest: Manifest,
     dict: Dictionary,
     docs: Vec<DocMeta>,
-    /// For each name id: (encoded occurrence payloads, count).
-    postings: Vec<(Vec<u8>, u32)>,
+    postings: Postings,
 }
 
 impl Index {
     pub fn stats(&self) -> IndexStats {
-        let posting_bytes = self.postings.iter().map(|(b, _)| b.len()).sum();
+        let posting_bytes = self.postings.posting_bytes();
         IndexStats {
             backend: self.manifest.backend.clone(),
             token_mode: self.manifest.token_mode.as_str().to_string(),
@@ -103,11 +164,8 @@ impl Index {
         let Some(id) = self.dict.lookup(query) else {
             return Ok(Vec::new());
         };
-        let (blob, count) = self
-            .postings
-            .get(id as usize)
-            .ok_or_else(|| anyhow::anyhow!("corrupt index: name id {id} missing from postings"))?;
-        let occs = decode_occurrences(blob, *count as usize, limit)?;
+        let (blob, count) = self.postings.get(id as usize)?;
+        let occs = decode_occurrences(blob, count as usize, limit)?;
         let mut hits = Vec::with_capacity(occs.len());
         for occ in occs {
             let doc = self.docs.get(occ.doc_id as usize).ok_or_else(|| {
@@ -238,7 +296,9 @@ impl Index {
     pub fn open_dir(dir: &Path) -> anyhow::Result<Self> {
         let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
         if manifest.format_version != INDEX_FORMAT_VERSION {
-            let hint = if manifest.format_version == 0 || dir.join("occs.bin").is_file() {
+            let hint = if manifest.format_version == 2 {
+                "; re-run `scode index` to rebuild with format v3"
+            } else if manifest.format_version == 0 || dir.join("occs.bin").is_file() {
                 " (pre-v2 index with occs.bin; re-run `scode index`)"
             } else {
                 ""
@@ -252,7 +312,7 @@ impl Index {
         }
         let dict = Dictionary::from_bytes(&fs::read(dir.join("dict.bin"))?)?;
         let docs: Vec<DocMeta> = serde_json::from_slice(&fs::read(dir.join("docs.json"))?)?;
-        let postings = unpack_postings(&fs::read(dir.join("postings.bin"))?)?;
+        let postings = mmap_postings(&dir.join("postings.bin"))?;
         if postings.len() != dict.len() {
             anyhow::bail!(
                 "postings/dict length mismatch: {} vs {}",
@@ -277,6 +337,9 @@ pub struct SearchMultiResult {
 const INDEX_FILES: &[&str] = &["manifest.json", "dict.bin", "docs.json", "postings.bin"];
 /// v1 artifact; still allowed when replacing an existing index directory in place.
 const LEGACY_INDEX_FILES: &[&str] = &["occs.bin"];
+
+/// Bytes per offset-table row in v3 `postings.bin`: count, data offset, blob length.
+const POSTING_ENTRY_SIZE: usize = 12;
 
 fn is_known_index_file(name: &str) -> bool {
     INDEX_FILES.contains(&name) || LEGACY_INDEX_FILES.contains(&name)
@@ -348,51 +411,68 @@ fn promote_tmp(tmp: &Path, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pack_postings(postings: &[(Vec<u8>, u32)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-    for (blob, count) in postings {
-        out.extend_from_slice(&count.to_le_bytes());
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+fn pack_postings(postings: &Postings) -> Vec<u8> {
+    let n = postings.len();
+    let table_size = 4 + n * POSTING_ENTRY_SIZE;
+    let mut out = Vec::with_capacity(table_size);
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+    out.resize(table_size, 0);
+    let mut data_offset = 0u32;
+    let mut table_pos = 4usize;
+    for id in 0..n {
+        let (blob, count) = postings
+            .get(id)
+            .expect("pack_postings iterates only valid posting ids");
+        out[table_pos..table_pos + 4].copy_from_slice(&count.to_le_bytes());
+        out[table_pos + 4..table_pos + 8].copy_from_slice(&data_offset.to_le_bytes());
+        let len = blob.len() as u32;
+        out[table_pos + 8..table_pos + 12].copy_from_slice(&len.to_le_bytes());
+        table_pos += POSTING_ENTRY_SIZE;
         out.extend_from_slice(blob);
+        data_offset += len;
     }
     out
 }
 
-fn unpack_postings(mut data: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, u32)>> {
-    if data.len() < 4 {
+fn mmap_postings(path: &Path) -> anyhow::Result<Postings> {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    parse_postings_mmap(mmap)
+}
+
+fn parse_postings_mmap(mmap: Mmap) -> anyhow::Result<Postings> {
+    if mmap.len() < 4 {
         anyhow::bail!("truncated postings");
     }
-    let n = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-    data = &data[4..];
-    // Each posting needs at least an 8-byte header; reject absurd `n` before allocating.
-    if n > 0 && data.len() / 8 < n {
-        anyhow::bail!(
-            "postings count {n} exceeds remaining data ({} bytes)",
-            data.len()
-        );
+    let n = u32::from_le_bytes(mmap[..4].try_into().unwrap()) as usize;
+    let data_base = 4 + n * POSTING_ENTRY_SIZE;
+    if mmap.len() < data_base {
+        anyhow::bail!("truncated postings offset table");
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(n)
+    let mut meta = Vec::new();
+    meta.try_reserve_exact(n)
         .map_err(|e| anyhow::anyhow!("postings count {n} too large to allocate: {e}"))?;
+    let mut pos = 4usize;
     for _ in 0..n {
-        if data.len() < 8 {
+        if pos + POSTING_ENTRY_SIZE > mmap.len() {
             anyhow::bail!("truncated posting header");
         }
-        let count = u32::from_le_bytes(data[..4].try_into().unwrap());
-        let len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        data = &data[8..];
-        if data.len() < len {
+        let count = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+        let offset = u32::from_le_bytes(mmap[pos + 4..pos + 8].try_into().unwrap());
+        let len = u32::from_le_bytes(mmap[pos + 8..pos + 12].try_into().unwrap());
+        let start = data_base + offset as usize;
+        let end = start + len as usize;
+        if end > mmap.len() {
             anyhow::bail!("truncated posting blob");
         }
-        let mut blob = Vec::new();
-        blob.try_reserve_exact(len)
-            .map_err(|e| anyhow::anyhow!("posting blob length {len} too large to allocate: {e}"))?;
-        blob.extend_from_slice(&data[..len]);
-        data = &data[len..];
-        out.push((blob, count));
+        meta.push(PostingMeta { count, offset, len });
+        pos += POSTING_ENTRY_SIZE;
     }
-    Ok(out)
+    Ok(Postings::Mmap {
+        mmap: Arc::new(mmap),
+        meta,
+        data_base: data_base as u32,
+    })
 }
 
 /// Build an index from corpus input.
@@ -461,7 +541,7 @@ pub fn build_from_docs(docs_in: Vec<SourceDoc>, token_mode: TokenMode) -> anyhow
         manifest,
         dict,
         docs,
-        postings,
+        postings: Postings::InMemory(postings),
     })
 }
 
@@ -663,6 +743,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_v2_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            format_version: 2,
+            backend: "delta".into(),
+            token_mode: TokenMode::Idents,
+            doc_count: 0,
+            name_count: 0,
+            occurrence_count: 0,
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("dict.bin"), b"").unwrap();
+        fs::write(dir.path().join("docs.json"), b"[]").unwrap();
+        fs::write(dir.path().join("postings.bin"), [0u8, 0, 0, 0]).unwrap();
+        let err = Index::open_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unsupported index format version"), "{err}");
+        assert!(err.contains("format v3"), "{err}");
+    }
+
+    #[test]
     fn rejects_pre_v2_index_with_occs_bin() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest {
@@ -855,6 +959,25 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
+=======
+    fn mmap_open_reads_single_posting_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "A.java".into(),
+            text: "class A { Alpha a; Beta b; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        idx.write_to_dir(dir.path()).unwrap();
+        let loaded = Index::open_dir(dir.path()).unwrap();
+        assert_eq!(loaded.search("Alpha", None).unwrap().len(), 1);
+        assert_eq!(loaded.search("Beta", None).unwrap().len(), 1);
+        assert!(loaded.search("Missing", None).unwrap().is_empty());
+    }
+
+    #[test]
+>>>>>>> 4cb9706 (Add v3 postings offset table with mmap per-list read)
     fn search_limit_zero_returns_empty() {
         let docs = vec![SourceDoc {
             gav: "demo:lib:1".into(),
