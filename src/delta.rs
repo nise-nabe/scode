@@ -66,8 +66,9 @@ impl<'a> BitReader<'a> {
         Self { bytes, pos: 0 }
     }
 
-    /// Current bit offset into the stream (for tests and future mmap skip hooks).
-    pub fn position(&self) -> usize {
+    /// Current bit offset into the stream (for future mmap skip hooks).
+    #[allow(dead_code)]
+    pub(crate) fn position(&self) -> usize {
         self.pos
     }
 
@@ -432,6 +433,11 @@ mod tests {
     }
 
     #[test]
+    fn occurrence_decode_rejects_huge_count_with_zero_limit() {
+        assert!(decode_occurrences(&[0xff], 10_000, Some(0)).is_err());
+    }
+
+    #[test]
     fn occurrence_decode_rejects_same_doc_on_first_entry() {
         let mut w = BitWriter::new();
         w.write_bit(true); // invalid: same_doc on first entry
@@ -472,28 +478,24 @@ mod tests {
     }
 
     #[test]
-    fn decode_occurrences_limit_stops_before_full_decode() {
+    fn decode_occurrences_limit_skips_truncated_tail() {
         let occs = many_occurrences(100);
         let enc = encode_occurrences(&occs);
 
-        let mut r_limited = BitReader::new(&enc);
+        let mut r = BitReader::new(&enc);
         let mut doc_id = 0u32;
         for i in 0..10 {
-            decode_occurrence(&mut r_limited, i, &mut doc_id).unwrap();
+            decode_occurrence(&mut r, i, &mut doc_id).unwrap();
         }
-        let limited_pos = r_limited.position();
-
-        let mut r_full = BitReader::new(&enc);
-        doc_id = 0;
-        for i in 0..occs.len() {
-            decode_occurrence(&mut r_full, i, &mut doc_id).unwrap();
+        let mut corrupted = enc.clone();
+        for b in &mut corrupted[r.position().div_ceil(8)..] {
+            *b = 0;
         }
-        let full_pos = r_full.position();
 
-        assert!(
-            limited_pos < full_pos,
-            "limited={limited_pos} full={full_pos}"
-        );
+        assert!(decode_occurrences(&corrupted, occs.len(), None).is_err());
+        let limited = decode_occurrences(&corrupted, occs.len(), Some(10)).unwrap();
+        assert_eq!(limited.len(), 10);
+        assert_eq!(limited, occs[..10]);
     }
 
     #[test]

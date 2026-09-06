@@ -100,9 +100,6 @@ impl Index {
     }
 
     pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<Hit>> {
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
         let Some(id) = self.dict.lookup(query) else {
             return Ok(Vec::new());
         };
