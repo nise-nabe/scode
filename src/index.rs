@@ -8,10 +8,10 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::corpus::{self, CorpusInput, LoadOptions, SourceDoc, TokenMode};
+use crate::corpus::{self, CorpusInput, LoadOptions, SourceDoc};
 use crate::delta::{decode_gaps, encode_gaps};
 use crate::intern::Dictionary;
-use crate::lex::Occurrence;
+use crate::lex::{self, Occurrence, TokenMode};
 
 /// A locate hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,17 +178,23 @@ impl Index {
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
-        // Write into a sibling temp directory, then rename into place so a crash
-        // never leaves a half-written index that open_dir might partially accept.
+        // Write a complete index into a unique sibling temp dir, then swap into
+        // place. Never delete the live directory before the new one is ready.
         let parent = dir.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
-        let tmp = parent.join(format!(
-            ".{}.tmp-{}",
-            dir.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("scode-index"),
-            std::process::id()
-        ));
+        let name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("scode-index");
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp = parent.join(format!(".{name}.tmp-{unique}"));
         if tmp.exists() {
             fs::remove_dir_all(&tmp)?;
         }
@@ -212,17 +218,24 @@ impl Index {
         }
 
         if dir.exists() {
-            fs::remove_dir_all(dir)?;
-        }
-        if let Err(e) = fs::rename(&tmp, dir) {
-            // Cross-device fallback: copy then remove temp.
-            copy_dir_all(&tmp, dir).map_err(|copy_err| {
-                anyhow::anyhow!(
-                    "finalize index {}: rename failed ({e}), copy failed ({copy_err})",
-                    dir.display()
-                )
+            let bak = parent.join(format!(".{name}.bak-{unique}"));
+            if bak.exists() {
+                fs::remove_dir_all(&bak)?;
+            }
+            fs::rename(dir, &bak).map_err(|e| {
+                let _ = fs::remove_dir_all(&tmp);
+                anyhow::anyhow!("backup {}: {e}", dir.display())
             })?;
+            if let Err(e) = promote_tmp(&tmp, dir) {
+                // Best-effort restore of the previous index.
+                let _ = fs::rename(&bak, dir);
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+            let _ = fs::remove_dir_all(&bak);
+        } else if let Err(e) = promote_tmp(&tmp, dir) {
             let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
         }
         Ok(())
     }
@@ -267,6 +280,19 @@ fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
         } else {
             fs::copy(entry.path(), to)?;
         }
+    }
+    Ok(())
+}
+
+fn promote_tmp(tmp: &Path, dir: &Path) -> anyhow::Result<()> {
+    if let Err(e) = fs::rename(tmp, dir) {
+        copy_dir_all(tmp, dir).map_err(|copy_err| {
+            anyhow::anyhow!(
+                "finalize index {}: rename failed ({e}), copy failed ({copy_err})",
+                dir.display()
+            )
+        })?;
+        let _ = fs::remove_dir_all(tmp);
     }
     Ok(())
 }
@@ -319,7 +345,17 @@ fn unpack_postings(mut data: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, u32)>> {
     }
     let n = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
     data = &data[4..];
-    let mut out = Vec::with_capacity(n);
+    // Each posting needs at least an 8-byte header; reject absurd `n` before allocating.
+    if n > 0 && data.len() / 8 < n {
+        anyhow::bail!(
+            "postings count {n} exceeds remaining data ({} bytes)",
+            data.len()
+        );
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).map_err(|e| {
+        anyhow::anyhow!("postings count {n} too large to allocate: {e}")
+    })?;
     for _ in 0..n {
         if data.len() < 8 {
             anyhow::bail!("truncated posting header");
@@ -357,7 +393,7 @@ pub fn build_from_docs(docs_in: Vec<SourceDoc>, token_mode: TokenMode) -> anyhow
     let mut tokenized: Vec<(SourceDoc, Vec<Occurrence>)> = docs_in
         .into_par_iter()
         .map(|doc| {
-            let file_occs = corpus::occurrences_for(&doc, token_mode);
+            let file_occs = lex::tokenize(&doc.text, token_mode);
             (doc, file_occs)
         })
         .collect();
@@ -464,6 +500,29 @@ impl MemoryStore {
         let arc = Arc::new(idx);
         self.path_map.insert(key, arc.clone());
         Ok(arc)
+    }
+
+    /// Return a cached index without touching disk.
+    pub fn peek(&self, index_arg: Option<&str>) -> Option<Arc<Index>> {
+        match index_arg {
+            None | Some("") | Some("memory") => self.get_memory("default"),
+            Some(p) => {
+                let key = Path::new(p).to_string_lossy().into_owned();
+                self.path_map
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| self.get_memory(p))
+            }
+        }
+    }
+
+    /// Insert a disk-loaded index, returning any racing winner already present.
+    pub fn insert_loaded_path(&mut self, path: &Path, index: Arc<Index>) -> Arc<Index> {
+        let key = path.to_string_lossy().into_owned();
+        self.path_map
+            .entry(key)
+            .or_insert_with(|| index)
+            .clone()
     }
 
     pub fn unload_path(&mut self, path: &Path) -> bool {

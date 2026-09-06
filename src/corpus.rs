@@ -5,37 +5,8 @@ use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use walkdir::WalkDir;
-
-use crate::lex::{self, Occurrence};
-
-/// Token retention mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TokenMode {
-    /// Lexer identifiers outside comments/strings.
-    Idents,
-    /// Identifier-shaped tokens across the whole file (comments/strings included).
-    All,
-}
-
-impl TokenMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TokenMode::Idents => "idents",
-            TokenMode::All => "all",
-        }
-    }
-
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "idents" | "ident" => Ok(TokenMode::Idents),
-            "all" => Ok(TokenMode::All),
-            other => anyhow::bail!("unknown token-mode `{other}` (expected idents|all)"),
-        }
-    }
-}
 
 /// One source document ready for indexing.
 #[derive(Debug, Clone)]
@@ -102,6 +73,7 @@ pub struct LoadOptions<'a> {
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_JAR_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_JAR_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn validate_gav_segment(kind: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty() {
@@ -464,6 +436,7 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
 ) -> anyhow::Result<Vec<SourceDoc>> {
     let mut archive = zip::ZipArchive::new(reader)?;
     let mut docs = Vec::new();
+    let mut total_bytes = 0u64;
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
         let name = entry.name().to_string();
@@ -491,6 +464,14 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
         let Ok(text) = String::from_utf8(buf) else {
             continue;
         };
+        total_bytes = total_bytes
+            .checked_add(text.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("jar uncompressed size overflow"))?;
+        if total_bytes > MAX_JAR_TOTAL_BYTES {
+            anyhow::bail!(
+                "jar uncompressed content exceeds limit ({MAX_JAR_TOTAL_BYTES} bytes)"
+            );
+        }
         docs.push(SourceDoc {
             gav: gav.to_string(),
             path: name.replace('\\', "/"),
@@ -501,10 +482,6 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
     Ok(docs)
 }
 
-/// Extract occurrences for a document.
-pub fn occurrences_for(doc: &SourceDoc, mode: TokenMode) -> Vec<Occurrence> {
-    lex::tokenize(&doc.text, mode)
-}
 
 #[cfg(test)]
 mod tests {

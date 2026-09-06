@@ -1,6 +1,34 @@
 //! Java / Kotlin lexical identifier extraction.
 
-use crate::corpus::TokenMode;
+use serde::{Deserialize, Serialize};
+
+/// Token retention mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenMode {
+    /// Lexer identifiers outside comments/strings.
+    Idents,
+    /// Identifier-shaped tokens across the whole file (comments/strings included).
+    All,
+}
+
+impl TokenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenMode::Idents => "idents",
+            TokenMode::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "idents" | "ident" => Ok(TokenMode::Idents),
+            "all" => Ok(TokenMode::All),
+            other => anyhow::bail!("unknown token-mode `{other}` (expected idents|all)"),
+        }
+    }
+}
+
 
 /// A single name occurrence in a source file.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use scode::corpus::{LoadOptions, TokenMode};
+use scode::corpus::LoadOptions;
+use scode::lex::TokenMode;
 use scode::index::{index_and_maybe_write, Index};
 
 #[derive(Debug, Parser)]
@@ -23,9 +24,6 @@ enum Command {
         /// Output index directory
         #[arg(long)]
         out: PathBuf,
-        /// Index backend (only delta is supported)
-        #[arg(long, default_value = "delta")]
-        backend: String,
         /// Token mode
         #[arg(long, value_enum, default_value_t = TokenModeArg::Idents)]
         token_mode: TokenModeArg,
@@ -92,16 +90,12 @@ fn main() -> anyhow::Result<()> {
         Command::Index {
             input,
             out,
-            backend,
             token_mode,
             fetch,
             cache_dir,
             local_repo,
             repository,
         } => {
-            if backend != "delta" {
-                anyhow::bail!("unsupported backend `{backend}` (only `delta`)");
-            }
             let index = index_and_maybe_write(
                 &input,
                 Some(&out),

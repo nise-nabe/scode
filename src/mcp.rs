@@ -11,8 +11,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::corpus::{LoadOptions, TokenMode};
-use crate::index::{index_and_maybe_write, MemoryStore};
+use crate::corpus::LoadOptions;
+use crate::lex::TokenMode;
+use crate::index::{index_and_maybe_write, Index, MemoryStore};
 
 #[derive(Clone)]
 pub struct ScodeMcp {
@@ -119,6 +120,44 @@ fn map_err(e: anyhow::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
+impl ScodeMcp {
+    /// Resolve an index without holding the async mutex across disk IO or rayon work.
+    async fn resolve_index(&self, index_arg: Option<&str>) -> Result<Arc<Index>, McpError> {
+        {
+            let store = self.store.lock().await;
+            if let Some(idx) = store.peek(index_arg) {
+                return Ok(idx);
+            }
+            if matches!(index_arg, None | Some("") | Some("memory")) {
+                return Err(map_err(anyhow::anyhow!(
+                    "no in-memory index; call scode_index first"
+                )));
+            }
+        }
+
+        let Some(p) = index_arg.filter(|s| !s.is_empty() && *s != "memory") else {
+            return Err(map_err(anyhow::anyhow!(
+                "no in-memory index; call scode_index first"
+            )));
+        };
+        let path = PathBuf::from(p);
+        if path.exists() {
+            let path_for_load = path.clone();
+            let loaded = tokio::task::spawn_blocking(move || Index::open_dir(&path_for_load))
+                .await
+                .map_err(|e| map_err(anyhow::anyhow!("load task join: {e}")))?
+                .map_err(map_err)?;
+            let mut store = self.store.lock().await;
+            Ok(store.insert_loaded_path(&path, Arc::new(loaded)))
+        } else {
+            let store = self.store.lock().await;
+            store
+                .get_memory(p)
+                .ok_or_else(|| map_err(anyhow::anyhow!("index not found: {p}")))
+        }
+    }
+}
+
 #[tool_router]
 impl ScodeMcp {
     #[tool(
@@ -175,11 +214,13 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let index = {
-            let mut store = self.store.lock().await;
-            store.resolve(args.index.as_deref()).map_err(map_err)?
-        };
-        let hits = index.search(&args.query, args.limit).map_err(map_err)?;
+        let index = self.resolve_index(args.index.as_deref()).await?;
+        let query = args.query.clone();
+        let limit = args.limit;
+        let hits = tokio::task::spawn_blocking(move || index.search(&query, limit))
+            .await
+            .map_err(|e| map_err(anyhow::anyhow!("search task join: {e}")))?
+            .map_err(map_err)?;
         let from_memory = match args.index.as_deref() {
             None | Some("") | Some("memory") => true,
             Some(p) => !Path::new(p).exists(),
@@ -197,13 +238,16 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<SearchMultiArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let index = {
-            let mut store = self.store.lock().await;
-            store.resolve(args.index.as_deref()).map_err(map_err)?
-        };
-        let res = index
-            .search_multi(&args.queries, args.limit, args.per_query_limit)
-            .map_err(map_err)?;
+        let index = self.resolve_index(args.index.as_deref()).await?;
+        let queries = args.queries.clone();
+        let limit = args.limit;
+        let per_query_limit = args.per_query_limit;
+        let res = tokio::task::spawn_blocking(move || {
+            index.search_multi(&queries, limit, per_query_limit)
+        })
+        .await
+        .map_err(|e| map_err(anyhow::anyhow!("search_multi task join: {e}")))?
+        .map_err(map_err)?;
         text_ok(serde_json::json!({
             "queries": args.queries,
             "hits": res.hits,
@@ -216,10 +260,7 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<StatsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let index = {
-            let mut store = self.store.lock().await;
-            store.resolve(args.index.as_deref()).map_err(map_err)?
-        };
+        let index = self.resolve_index(args.index.as_deref()).await?;
         text_ok(index.stats())
     }
 
@@ -228,10 +269,24 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<LoadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut store = self.store.lock().await;
-        let idx = store
-            .load_path(Path::new(&args.path))
+        let path = PathBuf::from(&args.path);
+        {
+            let store = self.store.lock().await;
+            if let Some(idx) = store.peek(Some(path.to_str().unwrap_or(args.path.as_str()))) {
+                return text_ok(serde_json::json!({
+                    "ok": true,
+                    "path": args.path,
+                    "stats": idx.stats(),
+                }));
+            }
+        }
+        let path_for_load = path.clone();
+        let loaded = tokio::task::spawn_blocking(move || Index::open_dir(&path_for_load))
+            .await
+            .map_err(|e| map_err(anyhow::anyhow!("load task join: {e}")))?
             .map_err(map_err)?;
+        let mut store = self.store.lock().await;
+        let idx = store.insert_loaded_path(&path, Arc::new(loaded));
         text_ok(serde_json::json!({
             "ok": true,
             "path": args.path,

@@ -1,8 +1,8 @@
 //! Fixture smoke tests for CLI-facing index flows.
 
-use scode::corpus::{CorpusInput, LoadOptions, TokenMode};
+use scode::corpus::{CorpusInput, LoadOptions};
 use scode::index::{build_from_docs, build_index};
-use scode::SourceDoc;
+use scode::{SourceDoc, TokenMode};
 use std::path::PathBuf;
 
 #[test]

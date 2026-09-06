@@ -7,7 +7,8 @@ pub mod intern;
 pub mod lex;
 pub mod mcp;
 
-pub use corpus::{CorpusInput, LoadOptions, SourceDoc, TokenMode};
+pub use corpus::{CorpusInput, LoadOptions, SourceDoc};
+pub use lex::TokenMode;
 pub use index::{
     build_from_docs, build_index, index_and_maybe_write, Hit, Index, IndexStats, MemoryStore,
     SearchMultiResult,
