@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -346,17 +347,45 @@ fn load_frozen(
 
 fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     eprintln!("fetching {url}");
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = fs::File::create(dest)
-        .map_err(|e| anyhow::anyhow!("create {}: {e}", dest.display()))?;
-    let mut reader = resp.into_reader();
-    io::copy(&mut reader, &mut file)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", dest.display()))?;
+    // Write to a sibling temp path, then rename so interrupted downloads
+    // never leave a partial jar that looks like a valid cache hit.
+    let mut tmp_os = dest.as_os_str().to_owned();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> anyhow::Result<()> {
+        let resp = ureq::get(url)
+            .timeout(Duration::from_secs(300))
+            .call()
+            .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
+        let mut file = fs::File::create(&tmp)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", tmp.display()))?;
+        let mut reader = resp.into_reader();
+        io::copy(&mut reader, &mut file)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("sync {}: {e}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp, dest) {
+        fs::copy(&tmp, dest).map_err(|copy_err| {
+            anyhow::anyhow!(
+                "finalize {}: rename failed ({e}), copy failed ({copy_err})",
+                dest.display()
+            )
+        })?;
+        let _ = fs::remove_file(&tmp);
+    }
     Ok(())
 }
 

@@ -145,9 +145,9 @@ impl ScodeMcp {
 
         let stats = index.stats();
         let mut store = self.store.lock().await;
-        store.insert_memory(&args.memory_id, index);
+        let arc = store.insert_memory(&args.memory_id, index);
         if let Some(ref dir) = out {
-            store.load_path(dir).map_err(map_err)?;
+            store.insert_path(dir, arc);
         }
 
         text_ok(serde_json::json!({
@@ -163,9 +163,11 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut store = self.store.lock().await;
-        let index = store.resolve(args.index.as_deref()).map_err(map_err)?;
-        let hits = index.search(&args.query, args.limit);
+        let index = {
+            let mut store = self.store.lock().await;
+            store.resolve(args.index.as_deref()).map_err(map_err)?
+        };
+        let hits = index.search(&args.query, args.limit).map_err(map_err)?;
         let from_memory = match args.index.as_deref() {
             None | Some("") | Some("memory") => true,
             Some(p) => !Path::new(p).exists(),
@@ -183,9 +185,13 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<SearchMultiArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut store = self.store.lock().await;
-        let index = store.resolve(args.index.as_deref()).map_err(map_err)?;
-        let res = index.search_multi(&args.queries, args.limit, args.per_query_limit);
+        let index = {
+            let mut store = self.store.lock().await;
+            store.resolve(args.index.as_deref()).map_err(map_err)?
+        };
+        let res = index
+            .search_multi(&args.queries, args.limit, args.per_query_limit)
+            .map_err(map_err)?;
         text_ok(serde_json::json!({
             "queries": args.queries,
             "hits": res.hits,
@@ -198,8 +204,10 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<StatsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut store = self.store.lock().await;
-        let index = store.resolve(args.index.as_deref()).map_err(map_err)?;
+        let index = {
+            let mut store = self.store.lock().await;
+            store.resolve(args.index.as_deref()).map_err(map_err)?
+        };
         text_ok(index.stats())
     }
 

@@ -140,24 +140,30 @@ pub fn encode_gaps(positions: &[u32]) -> Vec<u8> {
 }
 
 /// Decode `count` positions from gap+Elias-δ bytes.
-pub fn decode_gaps(bytes: &[u8], count: usize) -> Vec<u32> {
+pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
     if count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut r = BitReader::new(bytes);
     let mut out = Vec::with_capacity(count);
     let mut prev = 0u32;
     for i in 0..count {
-        let gap = r.read_delta().expect("truncated Elias-δ stream") as u32;
+        let gap = r
+            .read_delta()
+            .ok_or_else(|| anyhow::anyhow!("truncated or corrupt Elias-δ stream"))?
+            as u32;
         let p = if i == 0 {
-            gap.checked_sub(1).expect("bad first gap")
+            gap.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("bad first Elias-δ gap"))?
         } else {
-            prev.checked_add(gap).expect("position overflow")
+            prev
+                .checked_add(gap)
+                .ok_or_else(|| anyhow::anyhow!("position overflow while decoding postings"))?
         };
         out.push(p);
         prev = p;
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -181,14 +187,21 @@ mod tests {
     fn gap_roundtrip() {
         let positions = vec![0, 1, 2, 5, 100, 101, 1000, 50_000];
         let enc = encode_gaps(&positions);
-        let dec = decode_gaps(&enc, positions.len());
+        let dec = decode_gaps(&enc, positions.len()).unwrap();
         assert_eq!(dec, positions);
     }
 
     #[test]
     fn empty_gaps() {
         assert!(encode_gaps(&[]).is_empty());
-        assert!(decode_gaps(&[], 0).is_empty());
+        assert!(decode_gaps(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_truncated() {
+        assert!(decode_gaps(&[], 1).is_err());
+        let enc = encode_gaps(&[1, 2, 3]);
+        assert!(decode_gaps(&enc, 4).is_err());
     }
 
     #[test]

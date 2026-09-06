@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
             json,
         } => {
             let idx = Index::open_dir(&index)?;
-            let hits = idx.search(&query, limit);
+            let hits = idx.search(&query, limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
             } else {
@@ -145,7 +145,7 @@ fn main() -> anyhow::Result<()> {
             json,
         } => {
             let idx = Index::open_dir(&index)?;
-            let res = idx.search_multi(&queries, limit, per_query_limit);
+            let res = idx.search_multi(&queries, limit, per_query_limit)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else {

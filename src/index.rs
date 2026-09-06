@@ -101,12 +101,12 @@ impl Index {
         }
     }
 
-    pub fn search(&self, query: &str, limit: Option<usize>) -> Vec<Hit> {
+    pub fn search(&self, query: &str, limit: Option<usize>) -> anyhow::Result<Vec<Hit>> {
         let Some(id) = self.dict.lookup(query) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let (blob, count) = &self.postings[id as usize];
-        let indices = decode_gaps(blob, *count as usize);
+        let indices = decode_gaps(blob, *count as usize)?;
         let mut hits = Vec::with_capacity(indices.len());
         for idx in indices {
             let occ = self.occs[idx as usize];
@@ -122,7 +122,7 @@ impl Index {
                 break;
             }
         }
-        hits
+        Ok(hits)
     }
 
     /// Multi-query OR with dedup and matched_queries tags.
@@ -131,11 +131,15 @@ impl Index {
         queries: &[String],
         limit: Option<usize>,
         per_query_limit: Option<usize>,
-    ) -> SearchMultiResult {
-        let partials: Vec<(String, Vec<Hit>)> = queries
+    ) -> anyhow::Result<SearchMultiResult> {
+        let partials: Result<Vec<(String, Vec<Hit>)>, anyhow::Error> = queries
             .par_iter()
-            .map(|q| (q.clone(), self.search(q, per_query_limit)))
+            .map(|q| {
+                self.search(q, per_query_limit)
+                    .map(|hits| (q.clone(), hits))
+            })
             .collect();
+        let partials = partials?;
 
         let mut map: HashMap<(String, String, u32, u32), Hit> = HashMap::new();
         for (q, hits) in partials {
@@ -161,7 +165,7 @@ impl Index {
         if let Some(l) = limit {
             merged.truncate(l);
         }
-        SearchMultiResult { hits: merged }
+        Ok(SearchMultiResult { hits: merged })
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
@@ -389,6 +393,12 @@ impl MemoryStore {
         arc
     }
 
+    /// Register an already-built index under a disk path without re-reading it.
+    pub fn insert_path(&mut self, path: &Path, index: Arc<Index>) {
+        let key = path.to_string_lossy().into_owned();
+        self.path_map.insert(key, index);
+    }
+
     pub fn get_memory(&self, id: &str) -> Option<Arc<Index>> {
         self.map.get(id).cloned()
     }
@@ -455,10 +465,10 @@ mod tests {
             .into(),
         }];
         let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
-        let hits = idx.search("HttpClient", None);
+        let hits = idx.search("HttpClient", None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "Foo.java");
-        let close = idx.search("CloseableHttpClient", None);
+        let close = idx.search("CloseableHttpClient", None).unwrap();
         assert_eq!(close.len(), 1);
     }
 
@@ -470,11 +480,13 @@ mod tests {
             text: "class A { HttpClient a; Foo b; }\n".into(),
         }];
         let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
-        let res = idx.search_multi(
-            &["HttpClient".into(), "Foo".into(), "HttpClient".into()],
-            None,
-            None,
-        );
+        let res = idx
+            .search_multi(
+                &["HttpClient".into(), "Foo".into(), "HttpClient".into()],
+                None,
+                None,
+            )
+            .unwrap();
         assert_eq!(res.hits.len(), 2);
         let hc = res
             .hits
@@ -495,7 +507,7 @@ mod tests {
         let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
         idx.write_to_dir(dir.path()).unwrap();
         let loaded = Index::open_dir(dir.path()).unwrap();
-        assert_eq!(loaded.search("Bar", None).len(), 1);
+        assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
         assert_eq!(loaded.stats().names, idx.stats().names);
     }
 }
