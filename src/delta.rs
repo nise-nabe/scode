@@ -66,6 +66,11 @@ impl<'a> BitReader<'a> {
         Self { bytes, pos: 0 }
     }
 
+    /// Current bit offset into the stream (for tests and future mmap skip hooks).
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     pub fn read_bit(&mut self) -> Option<bool> {
         let byte_i = self.pos / 8;
         if byte_i >= self.bytes.len() {
@@ -208,61 +213,88 @@ pub fn encode_occurrences(occs: &[OccPos]) -> Vec<u8> {
     w.finish()
 }
 
-/// Decode `count` occurrence payloads from a posting blob.
-pub fn decode_occurrences(bytes: &[u8], count: usize) -> anyhow::Result<Vec<OccPos>> {
+fn decode_occurrence(
+    r: &mut BitReader<'_>,
+    index: usize,
+    doc_id: &mut u32,
+) -> anyhow::Result<OccPos> {
+    let same_doc = r
+        .read_bit()
+        .ok_or_else(|| anyhow::anyhow!("truncated occurrence posting"))?;
+    if index == 0 && same_doc {
+        anyhow::bail!("invalid occurrence posting: first entry cannot set same_doc");
+    }
+    if !same_doc {
+        let gap_u64 = r
+            .read_delta()
+            .ok_or_else(|| anyhow::anyhow!("truncated doc_id in occurrence posting"))?;
+        let gap: u32 = gap_u64
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("doc_id gap does not fit in u32"))?;
+        *doc_id = if index == 0 {
+            gap.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("bad first doc_id gap"))?
+        } else {
+            doc_id
+                .checked_add(gap)
+                .ok_or_else(|| anyhow::anyhow!("doc_id overflow in occurrence posting"))?
+        };
+    }
+    let line_u64 = r
+        .read_delta()
+        .ok_or_else(|| anyhow::anyhow!("truncated line in occurrence posting"))?;
+    let line_raw: u32 = line_u64
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("line does not fit in u32"))?;
+    let line = line_raw
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid line value in occurrence posting"))?;
+    let col_u64 = r
+        .read_delta()
+        .ok_or_else(|| anyhow::anyhow!("truncated col in occurrence posting"))?;
+    let col_raw: u32 = col_u64
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("col does not fit in u32"))?;
+    let col = col_raw
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid col value in occurrence posting"))?;
+    Ok(OccPos {
+        doc_id: *doc_id,
+        line,
+        col,
+    })
+}
+
+/// Decode occurrence payloads from a posting blob.
+///
+/// Decodes at most `count` entries (the stored posting length). When `limit` is
+/// set, stops after that many hits so locate/search can early-exit without
+/// decoding unused tails. Hit order follows posting list order (doc_id, line, col).
+pub fn decode_occurrences(
+    bytes: &[u8],
+    count: usize,
+    limit: Option<usize>,
+) -> anyhow::Result<Vec<OccPos>> {
     if count == 0 {
         return Ok(Vec::new());
     }
+    let decode_count = match limit {
+        Some(0) => return Ok(Vec::new()),
+        Some(l) => l.min(count),
+        None => count,
+    };
     // Each occurrence needs at least one flag bit plus two Elias-δ values.
     let max_bits = bytes.len().saturating_mul(8);
-    if count > max_bits {
-        anyhow::bail!("occurrence count {count} exceeds bitstream capacity ({max_bits} bits)");
+    if decode_count > max_bits {
+        anyhow::bail!(
+            "occurrence decode count {decode_count} exceeds bitstream capacity ({max_bits} bits)"
+        );
     }
     let mut r = BitReader::new(bytes);
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(decode_count);
     let mut doc_id = 0u32;
-    for i in 0..count {
-        let same_doc = r
-            .read_bit()
-            .ok_or_else(|| anyhow::anyhow!("truncated occurrence posting"))?;
-        if i == 0 && same_doc {
-            anyhow::bail!("invalid occurrence posting: first entry cannot set same_doc");
-        }
-        if !same_doc {
-            let gap_u64 = r
-                .read_delta()
-                .ok_or_else(|| anyhow::anyhow!("truncated doc_id in occurrence posting"))?;
-            let gap: u32 = gap_u64
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("doc_id gap does not fit in u32"))?;
-            doc_id = if i == 0 {
-                gap.checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("bad first doc_id gap"))?
-            } else {
-                doc_id
-                    .checked_add(gap)
-                    .ok_or_else(|| anyhow::anyhow!("doc_id overflow in occurrence posting"))?
-            };
-        }
-        let line_u64 = r
-            .read_delta()
-            .ok_or_else(|| anyhow::anyhow!("truncated line in occurrence posting"))?;
-        let line_raw: u32 = line_u64
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("line does not fit in u32"))?;
-        let line = line_raw
-            .checked_sub(1)
-            .ok_or_else(|| anyhow::anyhow!("invalid line value in occurrence posting"))?;
-        let col_u64 = r
-            .read_delta()
-            .ok_or_else(|| anyhow::anyhow!("truncated col in occurrence posting"))?;
-        let col_raw: u32 = col_u64
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("col does not fit in u32"))?;
-        let col = col_raw
-            .checked_sub(1)
-            .ok_or_else(|| anyhow::anyhow!("invalid col value in occurrence posting"))?;
-        out.push(OccPos { doc_id, line, col });
+    for i in 0..decode_count {
+        out.push(decode_occurrence(&mut r, i, &mut doc_id)?);
     }
     Ok(out)
 }
@@ -358,7 +390,7 @@ mod tests {
             },
         ];
         let enc = encode_occurrences(&occs);
-        let dec = decode_occurrences(&enc, occs.len()).unwrap();
+        let dec = decode_occurrences(&enc, occs.len(), None).unwrap();
         assert_eq!(dec, occs);
     }
 
@@ -387,13 +419,13 @@ mod tests {
             },
         ];
         let enc = encode_occurrences(&occs);
-        let dec = decode_occurrences(&enc, occs.len()).unwrap();
+        let dec = decode_occurrences(&enc, occs.len(), None).unwrap();
         assert_eq!(dec, occs);
     }
 
     #[test]
     fn occurrence_decode_rejects_huge_count() {
-        assert!(decode_occurrences(&[0xff], 10_000).is_err());
+        assert!(decode_occurrences(&[0xff], 10_000, None).is_err());
     }
 
     #[test]
@@ -403,12 +435,72 @@ mod tests {
         w.write_delta(1);
         w.write_delta(1);
         let enc = w.finish();
-        assert!(decode_occurrences(&enc, 1).is_err());
+        assert!(decode_occurrences(&enc, 1, None).is_err());
     }
 
     #[test]
     fn occurrence_empty() {
         assert!(encode_occurrences(&[]).is_empty());
-        assert!(decode_occurrences(&[], 0).unwrap().is_empty());
+        assert!(decode_occurrences(&[], 0, None).unwrap().is_empty());
+    }
+
+    fn many_occurrences(n: usize) -> Vec<OccPos> {
+        (0..n)
+            .map(|i| OccPos {
+                doc_id: 0,
+                line: (i + 1) as u32,
+                col: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decode_occurrences_respects_limit() {
+        let occs = many_occurrences(200);
+        let enc = encode_occurrences(&occs);
+        let limited = decode_occurrences(&enc, occs.len(), Some(5)).unwrap();
+        let full_prefix = decode_occurrences(&enc, occs.len(), None)
+            .unwrap()
+            .into_iter()
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(limited.len(), 5);
+        assert_eq!(limited, full_prefix);
+    }
+
+    #[test]
+    fn decode_occurrences_limit_stops_before_full_decode() {
+        let occs = many_occurrences(100);
+        let enc = encode_occurrences(&occs);
+
+        let mut r_limited = BitReader::new(&enc);
+        let mut doc_id = 0u32;
+        for i in 0..10 {
+            decode_occurrence(&mut r_limited, i, &mut doc_id).unwrap();
+        }
+        let limited_pos = r_limited.position();
+
+        let mut r_full = BitReader::new(&enc);
+        doc_id = 0;
+        for i in 0..occs.len() {
+            decode_occurrence(&mut r_full, i, &mut doc_id).unwrap();
+        }
+        let full_pos = r_full.position();
+
+        assert!(
+            limited_pos < full_pos,
+            "limited={limited_pos} full={full_pos}"
+        );
+    }
+
+    #[test]
+    fn decode_occurrences_limit_zero_returns_empty() {
+        let occs = many_occurrences(10);
+        let enc = encode_occurrences(&occs);
+        assert!(
+            decode_occurrences(&enc, occs.len(), Some(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

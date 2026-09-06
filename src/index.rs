@@ -110,7 +110,7 @@ impl Index {
             .postings
             .get(id as usize)
             .ok_or_else(|| anyhow::anyhow!("corrupt index: name id {id} missing from postings"))?;
-        let occs = decode_occurrences(blob, *count as usize)?;
+        let occs = decode_occurrences(blob, *count as usize, limit)?;
         let mut hits = Vec::with_capacity(occs.len());
         for occ in occs {
             let doc = self.docs.get(occ.doc_id as usize).ok_or_else(|| {
@@ -123,9 +123,6 @@ impl Index {
                 col: occ.col,
                 matched_queries: Vec::new(),
             });
-            if limit.is_some_and(|l| hits.len() >= l) {
-                break;
-            }
         }
         Ok(hits)
     }
@@ -817,6 +814,47 @@ mod tests {
         assert!(peeked.search("PathOnly", None).unwrap().is_empty());
         let resolved = store.resolve(Some(key)).unwrap();
         assert_eq!(resolved.search("MemOnly", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_limit_caps_posting_decode() {
+        let docs: Vec<SourceDoc> = (0..100)
+            .map(|i| SourceDoc {
+                gav: format!("g:a:{i}"),
+                path: format!("F{i}.java"),
+                text: "class X { Target t; }\n".into(),
+            })
+            .collect();
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let limited = idx.search("Target", Some(5)).unwrap();
+        let full = idx.search("Target", None).unwrap();
+        assert_eq!(full.len(), 100);
+        assert_eq!(limited.len(), 5);
+        assert_eq!(
+            limited,
+            full.into_iter().take(5).collect::<Vec<_>>(),
+            "hits must follow posting order"
+        );
+    }
+
+    #[test]
+    fn search_multi_per_query_limit() {
+        let docs: Vec<SourceDoc> = (0..50)
+            .map(|i| SourceDoc {
+                gav: format!("g:a:{i}"),
+                path: format!("F{i}.java"),
+                text: format!("class X {{ Alpha a{i}; Beta b{i}; }}\n"),
+            })
+            .collect();
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let res = idx
+            .search_multi(&["Alpha".into(), "Beta".into()], None, Some(3))
+            .unwrap();
+        assert_eq!(res.hits.len(), 6);
+        let alpha = idx.search("Alpha", Some(3)).unwrap();
+        let beta = idx.search("Beta", Some(3)).unwrap();
+        assert_eq!(alpha.len(), 3);
+        assert_eq!(beta.len(), 3);
     }
 
     #[test]
