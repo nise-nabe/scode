@@ -270,7 +270,9 @@ fn decode_occurrence(
 ///
 /// Decodes at most `count` entries (the stored posting length). When `limit` is
 /// set, stops after that many hits so locate/search can early-exit without
-/// decoding unused tails. Hit order follows posting list order (doc_id, line, col).
+/// decoding unused tails. When `limit` is zero but `count > 0`, decodes and
+/// discards the first entry so structural corruption is still detected while
+/// returning no hits. Hit order follows posting list order (doc_id, line, col).
 pub fn decode_occurrences(
     bytes: &[u8],
     count: usize,
@@ -284,8 +286,13 @@ pub fn decode_occurrences(
     if count > max_bits {
         anyhow::bail!("occurrence count {count} exceeds bitstream capacity ({max_bits} bits)");
     }
+    if limit == Some(0) {
+        let mut r = BitReader::new(bytes);
+        let mut doc_id = 0u32;
+        decode_occurrence(&mut r, 0, &mut doc_id)?;
+        return Ok(Vec::new());
+    }
     let decode_count = match limit {
-        Some(0) => return Ok(Vec::new()),
         Some(l) => l.min(count),
         None => count,
     };
@@ -507,5 +514,15 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn decode_occurrences_limit_zero_detects_corrupt_first_entry() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // invalid: same_doc on first entry
+        w.write_delta(1);
+        w.write_delta(1);
+        let enc = w.finish();
+        assert!(decode_occurrences(&enc, 1, Some(0)).is_err());
     }
 }
