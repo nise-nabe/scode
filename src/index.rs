@@ -92,7 +92,7 @@ enum Postings {
     Mmap {
         mmap: Arc<Mmap>,
         meta: Vec<PostingMeta>,
-        data_base: u32,
+        data_base: usize,
     },
 }
 
@@ -120,11 +120,8 @@ impl Postings {
                 let entry = meta.get(id).ok_or_else(|| {
                     anyhow::anyhow!("corrupt index: name id {id} missing from postings")
                 })?;
-                let start = *data_base as usize + entry.offset as usize;
-                let end = start + entry.len as usize;
-                if end > mmap.len() {
-                    anyhow::bail!("corrupt postings: name id {id} blob out of range");
-                }
+                let (start, end) =
+                    posting_blob_bounds(mmap.len(), *data_base, entry.offset, entry.len)?;
                 Ok((&mmap[start..end], entry.count))
             }
         }
@@ -261,7 +258,7 @@ impl Index {
             )?;
             fs::write(tmp.join("dict.bin"), self.dict.to_bytes())?;
             fs::write(tmp.join("docs.json"), serde_json::to_vec(&self.docs)?)?;
-            fs::write(tmp.join("postings.bin"), pack_postings(&self.postings))?;
+            fs::write(tmp.join("postings.bin"), pack_postings(&self.postings)?)?;
             Ok(())
         })();
 
@@ -341,6 +338,36 @@ const LEGACY_INDEX_FILES: &[&str] = &["occs.bin"];
 /// Bytes per offset-table row in v3 `postings.bin`: count, data offset, blob length.
 const POSTING_ENTRY_SIZE: usize = 12;
 
+fn checked_add_usize(a: usize, b: usize, what: &str) -> anyhow::Result<usize> {
+    a.checked_add(b)
+        .ok_or_else(|| anyhow::anyhow!("{what} overflow"))
+}
+
+fn u32_from_usize(n: usize, what: &str) -> anyhow::Result<u32> {
+    u32::try_from(n).map_err(|_| anyhow::anyhow!("{what} does not fit in u32 ({n})"))
+}
+
+fn posting_table_bytes(n: usize) -> anyhow::Result<usize> {
+    let entry_bytes = n
+        .checked_mul(POSTING_ENTRY_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("postings table size overflow"))?;
+    checked_add_usize(4, entry_bytes, "postings table size")
+}
+
+fn posting_blob_bounds(
+    mmap_len: usize,
+    data_base: usize,
+    offset: u32,
+    len: u32,
+) -> anyhow::Result<(usize, usize)> {
+    let start = checked_add_usize(data_base, offset as usize, "posting blob offset")?;
+    let end = checked_add_usize(start, len as usize, "posting blob length")?;
+    if end > mmap_len {
+        anyhow::bail!("truncated posting blob");
+    }
+    Ok((start, end))
+}
+
 fn is_known_index_file(name: &str) -> bool {
     INDEX_FILES.contains(&name) || LEGACY_INDEX_FILES.contains(&name)
 }
@@ -411,11 +438,13 @@ fn promote_tmp(tmp: &Path, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pack_postings(postings: &Postings) -> Vec<u8> {
+fn pack_postings(postings: &Postings) -> anyhow::Result<Vec<u8>> {
     let n = postings.len();
-    let table_size = 4 + n * POSTING_ENTRY_SIZE;
-    let mut out = Vec::with_capacity(table_size);
-    out.extend_from_slice(&(n as u32).to_le_bytes());
+    let table_size = posting_table_bytes(n)?;
+    let blob_bytes = postings.posting_bytes();
+    let total_size = checked_add_usize(table_size, blob_bytes, "postings file size")?;
+    let mut out = Vec::with_capacity(total_size);
+    out.extend_from_slice(&u32_from_usize(n, "postings count")?.to_le_bytes());
     out.resize(table_size, 0);
     let mut data_offset = 0u32;
     let mut table_pos = 4usize;
@@ -423,15 +452,17 @@ fn pack_postings(postings: &Postings) -> Vec<u8> {
         let (blob, count) = postings
             .get(id)
             .expect("pack_postings iterates only valid posting ids");
+        let len = u32_from_usize(blob.len(), "posting blob length")?;
         out[table_pos..table_pos + 4].copy_from_slice(&count.to_le_bytes());
         out[table_pos + 4..table_pos + 8].copy_from_slice(&data_offset.to_le_bytes());
-        let len = blob.len() as u32;
         out[table_pos + 8..table_pos + 12].copy_from_slice(&len.to_le_bytes());
         table_pos += POSTING_ENTRY_SIZE;
         out.extend_from_slice(blob);
-        data_offset += len;
+        data_offset = data_offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("postings data offset overflow"))?;
     }
-    out
+    Ok(out)
 }
 
 fn mmap_postings(path: &Path) -> anyhow::Result<Postings> {
@@ -445,7 +476,7 @@ fn parse_postings_mmap(mmap: Mmap) -> anyhow::Result<Postings> {
         anyhow::bail!("truncated postings");
     }
     let n = u32::from_le_bytes(mmap[..4].try_into().unwrap()) as usize;
-    let data_base = 4 + n * POSTING_ENTRY_SIZE;
+    let data_base = posting_table_bytes(n)?;
     if mmap.len() < data_base {
         anyhow::bail!("truncated postings offset table");
     }
@@ -460,18 +491,14 @@ fn parse_postings_mmap(mmap: Mmap) -> anyhow::Result<Postings> {
         let count = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
         let offset = u32::from_le_bytes(mmap[pos + 4..pos + 8].try_into().unwrap());
         let len = u32::from_le_bytes(mmap[pos + 8..pos + 12].try_into().unwrap());
-        let start = data_base + offset as usize;
-        let end = start + len as usize;
-        if end > mmap.len() {
-            anyhow::bail!("truncated posting blob");
-        }
+        posting_blob_bounds(mmap.len(), data_base, offset, len)?;
         meta.push(PostingMeta { count, offset, len });
         pos += POSTING_ENTRY_SIZE;
     }
     Ok(Postings::Mmap {
         mmap: Arc::new(mmap),
         meta,
-        data_base: data_base as u32,
+        data_base,
     })
 }
 
@@ -959,8 +986,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
-=======
     fn mmap_open_reads_single_posting_list() {
         let dir = tempfile::tempdir().unwrap();
         let docs = vec![SourceDoc {
@@ -977,7 +1002,27 @@ mod tests {
     }
 
     #[test]
->>>>>>> 4cb9706 (Add v3 postings offset table with mmap per-list read)
+    fn mmap_rejects_posting_blob_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "A.java".into(),
+            text: "class A { Alpha a; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        idx.write_to_dir(dir.path()).unwrap();
+        let mut data = fs::read(dir.path().join("postings.bin")).unwrap();
+        // Corrupt first posting len to point past EOF (offset table entry 0 len field).
+        data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(dir.path().join("postings.bin"), data).unwrap();
+        let err = Index::open_dir(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("truncated posting blob") || err.contains("overflow"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn search_limit_zero_returns_empty() {
         let docs = vec![SourceDoc {
             gav: "demo:lib:1".into(),
