@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -502,6 +502,17 @@ pub fn index_and_maybe_write(
     Ok(index)
 }
 
+/// Cache-only index lookup (no disk I/O).
+#[derive(Debug)]
+pub enum CacheLookup {
+    /// Memory slot or previously loaded path.
+    Hit(Arc<Index>),
+    /// Default/`memory` with no slot filled.
+    MissingMemory,
+    /// Named target absent from the session; caller may open this path.
+    NeedDisk(PathBuf),
+}
+
 /// Session store for MCP in-memory / loaded indexes.
 #[derive(Default)]
 pub struct MemoryStore {
@@ -545,15 +556,32 @@ impl MemoryStore {
         Ok(arc)
     }
 
-    /// Return a cached index without touching disk.
-    /// Precedence for named targets: memory slot → loaded path (matches `resolve`).
-    pub fn peek(&self, index_arg: Option<&str>) -> Option<Arc<Index>> {
+    /// Cache-only lookup with one precedence policy:
+    /// default/`memory` -> memory slot `default`;
+    /// named target -> memory slot -> loaded path -> NeedDisk.
+    pub fn lookup(&self, index_arg: Option<&str>) -> CacheLookup {
         match index_arg {
-            None | Some("") | Some("memory") => self.get_memory("default"),
-            Some(p) => self.get_memory(p).or_else(|| {
-                let key = Path::new(p).to_string_lossy().into_owned();
-                self.path_map.get(&key).cloned()
-            }),
+            None | Some("") | Some("memory") => match self.get_memory("default") {
+                Some(idx) => CacheLookup::Hit(idx),
+                None => CacheLookup::MissingMemory,
+            },
+            Some(p) => {
+                if let Some(idx) = self.get_memory(p) {
+                    CacheLookup::Hit(idx)
+                } else if let Some(idx) = self.get_loaded_path(Path::new(p)) {
+                    CacheLookup::Hit(idx)
+                } else {
+                    CacheLookup::NeedDisk(PathBuf::from(p))
+                }
+            }
+        }
+    }
+
+    /// Return a cached index without touching disk (see [`Self::lookup`]).
+    pub fn peek(&self, index_arg: Option<&str>) -> Option<Arc<Index>> {
+        match self.lookup(index_arg) {
+            CacheLookup::Hit(idx) => Some(idx),
+            CacheLookup::MissingMemory | CacheLookup::NeedDisk(_) => None,
         }
     }
 
@@ -580,23 +608,30 @@ impl MemoryStore {
     }
 
     pub fn resolve(&mut self, index_arg: Option<&str>) -> anyhow::Result<Arc<Index>> {
-        match index_arg {
-            None | Some("") | Some("memory") => self
-                .get_memory("default")
-                .ok_or_else(|| anyhow::anyhow!("no in-memory index; call scode_index first")),
-            Some(p) => {
-                let path = Path::new(p);
-                // loaded path (via peek/path_map) is handled by callers; here prefer memory
-                // slot ids over colliding filesystem paths.
-                if let Some(mem) = self.get_memory(p) {
-                    Ok(mem)
-                } else if self.has_loaded_path(path) || path.exists() {
-                    self.load_path(path)
+        match self.lookup(index_arg) {
+            CacheLookup::Hit(idx) => Ok(idx),
+            CacheLookup::MissingMemory => {
+                anyhow::bail!("no in-memory index; call scode_index first")
+            }
+            CacheLookup::NeedDisk(path) => {
+                if path.exists() {
+                    self.load_path(&path)
                 } else {
-                    anyhow::bail!("index not found: {p}")
+                    anyhow::bail!("index not found: {}", path.display())
                 }
             }
         }
+    }
+
+    /// Unload with the same precedence as [`Self::lookup`]: memory slot, then loaded path.
+    pub fn unload_target(&mut self, target: &str) -> bool {
+        if target == "memory" {
+            return self.unload_memory("default");
+        }
+        if self.get_memory(target).is_some() {
+            return self.unload_memory(target);
+        }
+        self.unload_path(Path::new(target))
     }
 }
 

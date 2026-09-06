@@ -345,7 +345,20 @@ fn load_frozen(toml_path: &Path, opts: LoadOptions<'_>) -> anyhow::Result<Vec<So
                 cache.display()
             );
         };
-        docs.extend(load_sources_jar(&jar_path, &gav.coordinate())?);
+        match load_sources_jar(&jar_path, &gav.coordinate()) {
+            Ok(more) => docs.extend(more),
+            Err(e) => {
+                // Do not leave an unreadable HTTP-200 body stuck in the scode cache.
+                if jar_path.starts_with(&cache) {
+                    let _ = fs::remove_file(&jar_path);
+                    anyhow::bail!(
+                        "failed to read sources jar {} (removed from scode cache): {e}",
+                        jar_path.display()
+                    );
+                }
+                return Err(e);
+            }
+        }
     }
     Ok(docs)
 }
@@ -375,21 +388,52 @@ fn copy_with_limit(
 
 /// Redact userinfo from URLs before logging (best-effort, no extra deps).
 fn redact_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        if let Some(at) = rest.find('@') {
-            return format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
+    redact_userinfo_in_text(url)
+}
+
+/// Strip userinfo from any `scheme://userinfo@host` spans in free-form text
+/// (ureq error Display embeds the request URL).
+fn redact_userinfo_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("://") {
+        out.push_str(&rest[..idx + 3]);
+        let after = &rest[idx + 3..];
+        if let Some(at) = after.find('@') {
+            let userinfo = &after[..at];
+            if !userinfo.is_empty() && !userinfo.contains('/') {
+                rest = &after[at + 1..];
+                continue;
+            }
         }
+        rest = after;
     }
-    url.to_string()
+    out.push_str(rest);
+    out
+}
+
+fn validate_sources_jar_file(path: &Path) -> anyhow::Result<()> {
+    let file = fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("open downloaded jar {}: {e}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| anyhow::anyhow!("downloaded file is not a readable zip: {e}"))?;
+    if archive.is_empty() {
+        anyhow::bail!("downloaded jar is an empty zip");
+    }
+    // Touch the central directory / first entry to catch truncated zips early.
+    let _ = archive
+        .by_index(0)
+        .map_err(|e| anyhow::anyhow!("downloaded jar zip entries unreadable: {e}"))?;
+    Ok(())
 }
 
 fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
+    let safe = redact_url(url);
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-        anyhow::bail!("refusing non-http(s) download URL: {url}");
+        anyhow::bail!("refusing non-http(s) download URL: {safe}");
     }
-    eprintln!("fetching {}", redact_url(url));
+    eprintln!("fetching {safe}");
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -411,7 +455,12 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
         let resp = ureq::get(url)
             .timeout(Duration::from_secs(300))
             .call()
-            .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "download {safe}: {}",
+                    redact_userinfo_in_text(&e.to_string())
+                )
+            })?;
         let mut file =
             fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("create {}: {e}", tmp.display()))?;
         let mut reader = resp.into_reader();
@@ -423,6 +472,12 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     })();
 
     if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Refuse to promote non-zip / unreadable archives into the durable cache.
+    if let Err(e) = validate_sources_jar_file(&tmp) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -594,6 +649,30 @@ mod tests {
             sources_url: None,
         };
         assert!(bad_group.validate().is_err());
+    }
+
+    #[test]
+    fn redact_strips_userinfo_from_urls_and_error_text() {
+        assert_eq!(
+            redact_url("https://user:s3cret@mirror.example/maven2/a.jar"),
+            "https://mirror.example/maven2/a.jar"
+        );
+        let messy = "download failed: https://user:s3cret@host/x: status 404";
+        let scrubbed = redact_userinfo_in_text(messy);
+        assert!(!scrubbed.contains("s3cret"), "{scrubbed}");
+        assert!(scrubbed.contains("https://host/x"), "{scrubbed}");
+    }
+
+    #[test]
+    fn validate_sources_jar_rejects_non_zip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("not.jar");
+        fs::write(&p, b"definitely-not-a-zip").unwrap();
+        let err = validate_sources_jar_file(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("not a readable zip") || err.contains("zip"),
+            "{err}"
+        );
     }
 
     #[test]

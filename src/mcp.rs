@@ -1,6 +1,6 @@
 //! stdio MCP server for scode.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::{
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::corpus::LoadOptions;
-use crate::index::{Index, MemoryStore, index_and_maybe_write};
+use crate::index::{CacheLookup, Index, MemoryStore, index_and_maybe_write};
 use crate::lex::TokenMode;
 
 #[derive(Clone)]
@@ -139,43 +139,30 @@ fn validate_memory_id(id: &str) -> anyhow::Result<()> {
 impl ScodeMcp {
     /// Resolve an index without holding the async mutex across disk IO or rayon work.
     async fn resolve_index(&self, index_arg: Option<&str>) -> Result<Arc<Index>, McpError> {
-        {
+        let lookup = {
             let store = self.store.lock().await;
-            if let Some(idx) = store.peek(index_arg) {
-                return Ok(idx);
-            }
-            if matches!(index_arg, None | Some("") | Some("memory")) {
-                return Err(map_err(anyhow::anyhow!(
-                    "no in-memory index; call scode_index first"
-                )));
-            }
-        }
-
-        let Some(p) = index_arg.filter(|s| !s.is_empty() && *s != "memory") else {
-            return Err(map_err(anyhow::anyhow!(
-                "no in-memory index; call scode_index first"
-            )));
+            store.lookup(index_arg)
         };
-
-        // Prefer an explicit memory slot over treating a colliding filesystem path as an index.
-        {
-            let store = self.store.lock().await;
-            if let Some(mem) = store.get_memory(p) {
-                return Ok(mem);
+        match lookup {
+            CacheLookup::Hit(idx) => Ok(idx),
+            CacheLookup::MissingMemory => Err(map_err(anyhow::anyhow!(
+                "no in-memory index; call scode_index first"
+            ))),
+            CacheLookup::NeedDisk(path) => {
+                if !path.exists() {
+                    return Err(map_err(anyhow::anyhow!(
+                        "index not found: {}",
+                        path.display()
+                    )));
+                }
+                let path_for_load = path.clone();
+                let loaded = tokio::task::spawn_blocking(move || Index::open_dir(&path_for_load))
+                    .await
+                    .map_err(|e| map_err(anyhow::anyhow!("load task join: {e}")))?
+                    .map_err(map_err)?;
+                let mut store = self.store.lock().await;
+                Ok(store.insert_loaded_path(&path, Arc::new(loaded)))
             }
-        }
-
-        let path = PathBuf::from(p);
-        if path.exists() {
-            let path_for_load = path.clone();
-            let loaded = tokio::task::spawn_blocking(move || Index::open_dir(&path_for_load))
-                .await
-                .map_err(|e| map_err(anyhow::anyhow!("load task join: {e}")))?
-                .map_err(map_err)?;
-            let mut store = self.store.lock().await;
-            Ok(store.insert_loaded_path(&path, Arc::new(loaded)))
-        } else {
-            Err(map_err(anyhow::anyhow!("index not found: {p}")))
         }
     }
 }
@@ -328,23 +315,9 @@ impl ScodeMcp {
         Parameters(args): Parameters<UnloadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let target = args.target.as_str();
-        // Filesystem check before the async mutex so we do not stall other MCP calls.
-        let path = Path::new(target);
-        let path_exists = target != "memory" && path.exists();
         let mut store = self.store.lock().await;
-        // Same precedence as peek/resolve: memory slot → loaded path → on-disk path.
-        let removed = if target == "memory" {
-            store.unload_memory("default")
-        } else if store.get_memory(target).is_some() {
-            store.unload_memory(target)
-        } else if store.has_loaded_path(path) {
-            store.unload_path(path)
-        } else if path_exists {
-            // Not loaded in-session; unload_path is a no-op but keeps the API honest.
-            store.unload_path(path)
-        } else {
-            store.unload_memory(target)
-        };
+        // Single policy shared with lookup/resolve (memory slot then loaded path).
+        let removed = store.unload_target(target);
         text_ok(serde_json::json!({ "ok": removed, "target": args.target }))
     }
 }
