@@ -53,6 +53,7 @@ impl Dictionary {
     pub fn from_bytes(mut data: &[u8]) -> anyhow::Result<Self> {
         let n = read_u32(&mut data)? as usize;
         let mut dict = Dictionary::new();
+        dict.to_str.reserve(n);
         for _ in 0..n {
             let len = read_u32(&mut data)? as usize;
             if data.len() < len {
@@ -60,7 +61,18 @@ impl Dictionary {
             }
             let s = std::str::from_utf8(&data[..len])?.to_string();
             data = &data[len..];
-            dict.intern(&s);
+            let id = dict.to_str.len() as u32;
+            if dict.to_id.insert(s.clone(), id).is_some() {
+                anyhow::bail!("corrupt dictionary: duplicate string `{s}`");
+            }
+            dict.to_str.push(s);
+        }
+        if !data.is_empty() {
+            anyhow::bail!(
+                "corrupt dictionary: {} trailing byte(s) after {} entries",
+                data.len(),
+                n
+            );
         }
         Ok(dict)
     }
@@ -90,5 +102,28 @@ mod tests {
         let d2 = Dictionary::from_bytes(&bytes).unwrap();
         assert_eq!(d2.resolve(a), Some("HttpClient"));
         assert_eq!(d2.lookup("Foo"), Some(b));
+    }
+
+    #[test]
+    fn from_bytes_rejects_duplicate_strings() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        for s in ["Foo", "Foo"] {
+            let b = s.as_bytes();
+            bytes.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b);
+        }
+        let err = Dictionary::from_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn from_bytes_rejects_trailing_bytes() {
+        let mut d = Dictionary::new();
+        d.intern("Foo");
+        let mut bytes = d.to_bytes();
+        bytes.push(0xff);
+        let err = Dictionary::from_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("trailing"), "{err}");
     }
 }
