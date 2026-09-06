@@ -142,6 +142,9 @@ impl Index {
         limit: Option<usize>,
         per_query_limit: Option<usize>,
     ) -> anyhow::Result<SearchMultiResult> {
+        if limit == Some(0) {
+            return Ok(SearchMultiResult { hits: Vec::new() });
+        }
         let partials: Result<Vec<(String, Vec<Hit>)>, anyhow::Error> = queries
             .par_iter()
             .map(|q| {
@@ -304,6 +307,14 @@ fn ensure_replaceable_index_dir(dir: &Path) -> anyhow::Result<()> {
                  (expected only {}); use an empty directory or an existing scode index",
                 dir.display(),
                 INDEX_FILES.join(", ")
+            );
+        }
+        let ft = entry.file_type()?;
+        // A directory/symlink with an index-like name must not be wiped on rotate.
+        if ft.is_dir() || ft.is_symlink() || !ft.is_file() {
+            anyhow::bail!(
+                "refusing to replace {}: entry `{name}` is not a regular file",
+                dir.display()
             );
         }
     }
@@ -715,6 +726,24 @@ mod tests {
             "{err}"
         );
         assert!(dir.path().join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn refuses_out_dir_with_directory_named_like_index_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("manifest.json")).unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "X.java".into(),
+            text: "class X { Bar b; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let err = idx.write_to_dir(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file") || err.contains("refusing"),
+            "{err}"
+        );
+        assert!(dir.path().join("manifest.json").is_dir());
     }
 
     #[test]
