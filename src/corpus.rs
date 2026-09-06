@@ -280,7 +280,13 @@ fn load_tree(root: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
         let rel = path.strip_prefix(root).unwrap_or(path);
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping {}: {e}",
+                    path.display()
+                );
+                continue;
+            }
         };
         docs.push(SourceDoc {
             gav: gav.to_string(),
