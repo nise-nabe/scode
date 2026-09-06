@@ -15,7 +15,7 @@ cargo build --release
 
 ```bash
 # Index a source tree (idents = lexer identifiers outside comments/strings)
-scode index --backend delta --input fixtures/demo --out /tmp/scode-demo
+scode index --input fixtures/demo --out /tmp/scode-demo
 
 # Search
 scode search --index /tmp/scode-demo --query HttpClient

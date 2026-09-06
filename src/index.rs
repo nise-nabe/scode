@@ -180,6 +180,9 @@ impl Index {
     pub fn write_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
         // Write a complete index into a unique sibling temp dir, then swap into
         // place. Never delete the live directory before the new one is ready.
+        // Also refuse to replace a directory that contains non-index files so
+        // `--out` cannot wipe an unrelated tree.
+        ensure_replaceable_index_dir(dir)?;
         let parent = dir.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
         let name = dir
@@ -267,6 +270,44 @@ impl Index {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMultiResult {
     pub hits: Vec<Hit>,
+}
+
+const INDEX_FILES: &[&str] = &[
+    "manifest.json",
+    "dict.bin",
+    "docs.json",
+    "occs.bin",
+    "postings.bin",
+];
+
+/// Allow replace only for empty dirs or dirs that already look like an scode index.
+/// Prevents accidentally wiping unrelated files under `--out`.
+fn ensure_replaceable_index_dir(dir: &Path) -> anyhow::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    if !dir.is_dir() {
+        anyhow::bail!("index out path is not a directory: {}", dir.display());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            anyhow::bail!(
+                "refusing to replace {}: contains a non-UTF8 entry",
+                dir.display()
+            );
+        };
+        if !INDEX_FILES.contains(&name) {
+            anyhow::bail!(
+                "refusing to replace {}: contains non-index entry `{name}` \
+                 (expected only {}); use an empty directory or an existing scode index",
+                dir.display(),
+                INDEX_FILES.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
@@ -616,5 +657,20 @@ mod tests {
         let loaded = Index::open_dir(dir.path()).unwrap();
         assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
         assert_eq!(loaded.stats().names, idx.stats().names);
+    }
+
+    #[test]
+    fn refuses_non_index_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), b"keep me").unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "X.java".into(),
+            text: "class X { Bar b; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let err = idx.write_to_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("non-index") || err.contains("refusing"), "{err}");
+        assert!(dir.path().join("notes.txt").is_file());
     }
 }

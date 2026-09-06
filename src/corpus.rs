@@ -381,12 +381,19 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Write to a sibling temp path, then rename so interrupted downloads
-    // never leave a partial jar that looks like a valid cache hit.
+    // Unique sibling temp path so concurrent fetches of the same GAV cannot
+    // clobber each other; rename into place only after a full successful write.
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
     let mut tmp_os = dest.as_os_str().to_owned();
-    tmp_os.push(".tmp");
+    tmp_os.push(format!(".tmp-{unique}"));
     let tmp = PathBuf::from(tmp_os);
-    let _ = fs::remove_file(&tmp);
 
     let result = (|| -> anyhow::Result<()> {
         let resp = ureq::get(url)
