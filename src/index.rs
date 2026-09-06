@@ -105,7 +105,9 @@ impl Index {
         let Some(id) = self.dict.lookup(query) else {
             return Ok(Vec::new());
         };
-        let (blob, count) = &self.postings[id as usize];
+        let (blob, count) = self.postings.get(id as usize).ok_or_else(|| {
+            anyhow::anyhow!("corrupt index: name id {id} missing from postings")
+        })?;
         let indices = decode_gaps(blob, *count as usize)?;
         let mut hits = Vec::with_capacity(indices.len());
         for idx in indices {
@@ -176,15 +178,52 @@ impl Index {
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(dir)?;
-        fs::write(
-            dir.join("manifest.json"),
-            serde_json::to_vec_pretty(&self.manifest)?,
-        )?;
-        fs::write(dir.join("dict.bin"), self.dict.to_bytes())?;
-        fs::write(dir.join("docs.json"), serde_json::to_vec(&self.docs)?)?;
-        fs::write(dir.join("occs.bin"), pack_occs(&self.occs))?;
-        fs::write(dir.join("postings.bin"), pack_postings(&self.postings))?;
+        // Write into a sibling temp directory, then rename into place so a crash
+        // never leaves a half-written index that open_dir might partially accept.
+        let parent = dir.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(
+            ".{}.tmp-{}",
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("scode-index"),
+            std::process::id()
+        ));
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp)?;
+        }
+        fs::create_dir_all(&tmp)?;
+
+        let write_result = (|| -> anyhow::Result<()> {
+            fs::write(
+                tmp.join("manifest.json"),
+                serde_json::to_vec_pretty(&self.manifest)?,
+            )?;
+            fs::write(tmp.join("dict.bin"), self.dict.to_bytes())?;
+            fs::write(tmp.join("docs.json"), serde_json::to_vec(&self.docs)?)?;
+            fs::write(tmp.join("occs.bin"), pack_occs(&self.occs))?;
+            fs::write(tmp.join("postings.bin"), pack_postings(&self.postings))?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        if let Err(e) = fs::rename(&tmp, dir) {
+            // Cross-device fallback: copy then remove temp.
+            copy_dir_all(&tmp, dir).map_err(|copy_err| {
+                anyhow::anyhow!(
+                    "finalize index {}: rename failed ({e}), copy failed ({copy_err})",
+                    dir.display()
+                )
+            })?;
+            let _ = fs::remove_dir_all(&tmp);
+        }
         Ok(())
     }
 
@@ -215,6 +254,21 @@ impl Index {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMultiResult {
     pub hits: Vec<Hit>,
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
 }
 
 fn pack_occs(occs: &[Occ]) -> Vec<u8> {

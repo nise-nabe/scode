@@ -401,6 +401,10 @@ fn copy_with_limit(
 }
 
 fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        anyhow::bail!("refusing non-http(s) download URL: {url}");
+    }
     eprintln!("fetching {url}");
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -588,5 +592,15 @@ mod tests {
             sources_url: None,
         };
         assert!(bad_group.validate().is_err());
+    }
+
+    #[test]
+    fn download_rejects_non_http_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("x.jar");
+        let err = download_url("file:///etc/passwd", &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-http"), "{err}");
     }
 }
