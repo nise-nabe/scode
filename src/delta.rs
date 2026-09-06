@@ -66,7 +66,7 @@ impl<'a> BitReader<'a> {
         Self { bytes, pos: 0 }
     }
 
-    /// Current bit offset into the stream (for future mmap skip hooks).
+    /// Current bit offset into the stream (for mmap skip hooks).
     #[allow(dead_code)]
     pub(crate) fn position(&self) -> usize {
         self.pos

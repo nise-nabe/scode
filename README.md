@@ -103,7 +103,7 @@ Cursor example (`mcp.json`):
 
 CLI remains **disk-only**; memory-only indexes are MCP-session scoped (gone on process exit).
 
-## On-disk index (format v2)
+## On-disk index (format v3)
 
 `scode index --out DIR` writes:
 
@@ -112,9 +112,9 @@ CLI remains **disk-only**; memory-only indexes are MCP-session scoped (gone on p
 | `manifest.json` | `format_version`, token mode, counts |
 | `dict.bin` | Name dictionary |
 | `docs.json` | GAV + path per document |
-| `postings.bin` | Per-name occurrence lists (doc/line/col, gap + Elias-δ) |
+| `postings.bin` | Offset table + per-name occurrence blobs (doc/line/col, gap + Elias-δ) |
 
-Pre-v2 indexes that used a separate `occs.bin` table are rejected; re-run `scode index`.
+Indexes with `format_version` < 3 (including v2 inline postings and pre-v2 `occs.bin` layouts) are rejected; re-run `scode index`.
 
 ## Library layout
 
