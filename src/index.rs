@@ -294,13 +294,16 @@ impl Index {
         let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
         if manifest.format_version != INDEX_FORMAT_VERSION {
             let hint = if manifest.format_version == 2 {
-                "; re-run `scode index` to rebuild with format v3"
+                format!(
+                    "; re-run `scode index` to rebuild with format v{}",
+                    INDEX_FORMAT_VERSION
+                )
             } else if manifest.format_version == 0 || dir.join("occs.bin").is_file() {
-                " (pre-v2 index with occs.bin; re-run `scode index`)"
+                " (pre-v2 index with occs.bin; re-run `scode index`)".to_string()
             } else if manifest.format_version < INDEX_FORMAT_VERSION {
-                "; re-run `scode index` to rebuild"
+                "; re-run `scode index` to rebuild".to_string()
             } else {
-                ""
+                String::new()
             };
             anyhow::bail!(
                 "unsupported index format version {} (expected {}){}",
@@ -467,6 +470,9 @@ fn pack_postings(postings: &Postings) -> anyhow::Result<Vec<u8>> {
 
 fn mmap_postings(path: &Path) -> anyhow::Result<Postings> {
     let file = File::open(path)?;
+    // SAFETY: `postings.bin` is treated as immutable for the life of the mapped
+    // `Index`. Rebuilds write to a temp directory and atomically rename into
+    // place, so readers never mmap a file being modified in place.
     let mmap = unsafe { Mmap::map(&file)? };
     parse_postings_mmap(mmap)
 }
@@ -790,7 +796,10 @@ mod tests {
         fs::write(dir.path().join("postings.bin"), [0u8, 0, 0, 0]).unwrap();
         let err = Index::open_dir(dir.path()).unwrap_err().to_string();
         assert!(err.contains("unsupported index format version"), "{err}");
-        assert!(err.contains("format v3"), "{err}");
+        assert!(
+            err.contains(&format!("format v{}", INDEX_FORMAT_VERSION)),
+            "{err}"
+        );
     }
 
     #[test]
