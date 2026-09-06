@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -438,6 +438,12 @@ pub fn load_sources_jar_bytes(bytes: &[u8], gav: &str) -> anyhow::Result<Vec<Sou
     load_sources_jar_reader(Cursor::new(bytes), gav)
 }
 
+/// Reject zip-slip style paths (`..`, absolute, drive prefixes) before indexing names.
+fn is_safe_jar_entry_path(name: &str) -> bool {
+    let path = Path::new(name);
+    !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 fn load_sources_jar_reader<R: Read + io::Seek>(
     reader: R,
     gav: &str,
@@ -450,6 +456,9 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
         let name = entry.name().to_string();
         if entry.is_dir() {
             continue;
+        }
+        if !is_safe_jar_entry_path(&name) {
+            anyhow::bail!("jar entry has unsafe path `{name}`");
         }
         if !is_source_file(Path::new(&name)) {
             continue;
@@ -584,5 +593,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("non-http"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zip_slip_jar_entry_paths() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            w.start_file("../Evil.java", SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(b"class Evil {}").unwrap();
+            w.finish().unwrap();
+        }
+        let err = load_sources_jar_bytes(buf.get_ref(), "g:a:1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsafe path"), "{err}");
     }
 }

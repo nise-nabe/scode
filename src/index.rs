@@ -403,7 +403,10 @@ fn unpack_postings(mut data: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, u32)>> {
         if data.len() < len {
             anyhow::bail!("truncated posting blob");
         }
-        let blob = data[..len].to_vec();
+        let mut blob = Vec::new();
+        blob.try_reserve_exact(len)
+            .map_err(|e| anyhow::anyhow!("posting blob length {len} too large to allocate: {e}"))?;
+        blob.extend_from_slice(&data[..len]);
         data = &data[len..];
         out.push((blob, count));
     }

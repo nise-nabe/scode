@@ -300,17 +300,17 @@ impl ScodeMcp {
         &self,
         Parameters(args): Parameters<UnloadArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut store = self.store.lock().await;
         let target = args.target.as_str();
+        // Filesystem checks before taking the async mutex to avoid stalling other MCP calls.
+        let path = Path::new(target);
+        let path_exists = target != "memory" && path.exists();
+        let mut store = self.store.lock().await;
         let removed = if target == "memory" {
             store.unload_memory("default")
+        } else if path_exists || store.has_loaded_path(path) {
+            store.unload_path(path)
         } else {
-            let path = Path::new(target);
-            if path.exists() || store.has_loaded_path(path) {
-                store.unload_path(path)
-            } else {
-                store.unload_memory(target)
-            }
+            store.unload_memory(target)
         };
         text_ok(serde_json::json!({ "ok": removed, "target": args.target }))
     }
