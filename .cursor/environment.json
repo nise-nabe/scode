@@ -1,0 +1,4 @@
+{
+  "name": "scode (Rust)",
+  "install": "rustup toolchain install stable --profile minimal --component rustfmt --component clippy && rustup default stable && cargo build --locked --all-targets"
+}
