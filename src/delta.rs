@@ -173,6 +173,100 @@ pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
     Ok(out)
 }
 
+/// One occurrence position inside a posting list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OccPos {
+    pub doc_id: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Encode occurrence payloads for one posting list (sorted by doc_id, line, col).
+pub fn encode_occurrences(occs: &[OccPos]) -> Vec<u8> {
+    if occs.is_empty() {
+        return Vec::new();
+    }
+    let mut w = BitWriter::new();
+    let mut prev_doc = 0u32;
+    for (i, o) in occs.iter().enumerate() {
+        if i == 0 || o.doc_id != prev_doc {
+            w.write_bit(false);
+            let gap = if i == 0 {
+                o.doc_id.checked_add(1).expect("doc_id overflow")
+            } else {
+                assert!(o.doc_id > prev_doc, "occurrences must be sorted by doc_id");
+                o.doc_id - prev_doc
+            };
+            w.write_delta(u64::from(gap));
+            prev_doc = o.doc_id;
+        } else {
+            w.write_bit(true);
+        }
+        w.write_delta(u64::from(o.line) + 1);
+        w.write_delta(u64::from(o.col) + 1);
+    }
+    w.finish()
+}
+
+/// Decode `count` occurrence payloads from a posting blob.
+pub fn decode_occurrences(bytes: &[u8], count: usize) -> anyhow::Result<Vec<OccPos>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    // Each occurrence needs at least one flag bit plus two Elias-δ values.
+    let max_bits = bytes.len().saturating_mul(8);
+    if count > max_bits {
+        anyhow::bail!("occurrence count {count} exceeds bitstream capacity ({max_bits} bits)");
+    }
+    let mut r = BitReader::new(bytes);
+    let mut out = Vec::with_capacity(count);
+    let mut doc_id = 0u32;
+    for i in 0..count {
+        let same_doc = r
+            .read_bit()
+            .ok_or_else(|| anyhow::anyhow!("truncated occurrence posting"))?;
+        if i == 0 && same_doc {
+            anyhow::bail!("invalid occurrence posting: first entry cannot set same_doc");
+        }
+        if !same_doc {
+            let gap_u64 = r
+                .read_delta()
+                .ok_or_else(|| anyhow::anyhow!("truncated doc_id in occurrence posting"))?;
+            let gap: u32 = gap_u64
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("doc_id gap does not fit in u32"))?;
+            doc_id = if i == 0 {
+                gap.checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("bad first doc_id gap"))?
+            } else {
+                doc_id
+                    .checked_add(gap)
+                    .ok_or_else(|| anyhow::anyhow!("doc_id overflow in occurrence posting"))?
+            };
+        }
+        let line_u64 = r
+            .read_delta()
+            .ok_or_else(|| anyhow::anyhow!("truncated line in occurrence posting"))?;
+        let line_raw: u32 = line_u64
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("line does not fit in u32"))?;
+        let line = line_raw
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("invalid line value in occurrence posting"))?;
+        let col_u64 = r
+            .read_delta()
+            .ok_or_else(|| anyhow::anyhow!("truncated col in occurrence posting"))?;
+        let col_raw: u32 = col_u64
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("col does not fit in u32"))?;
+        let col = col_raw
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("invalid col value in occurrence posting"))?;
+        out.push(OccPos { doc_id, line, col });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +336,79 @@ mod tests {
     #[should_panic(expected = "strictly increasing")]
     fn gaps_reject_duplicates() {
         let _ = encode_gaps(&[1, 1, 2]);
+    }
+
+    #[test]
+    fn occurrence_roundtrip_single_doc() {
+        let occs = vec![
+            OccPos {
+                doc_id: 0,
+                line: 10,
+                col: 5,
+            },
+            OccPos {
+                doc_id: 0,
+                line: 10,
+                col: 20,
+            },
+            OccPos {
+                doc_id: 0,
+                line: 42,
+                col: 1,
+            },
+        ];
+        let enc = encode_occurrences(&occs);
+        let dec = decode_occurrences(&enc, occs.len()).unwrap();
+        assert_eq!(dec, occs);
+    }
+
+    #[test]
+    fn occurrence_roundtrip_multi_doc() {
+        let occs = vec![
+            OccPos {
+                doc_id: 0,
+                line: 1,
+                col: 0,
+            },
+            OccPos {
+                doc_id: 2,
+                line: 100,
+                col: 50,
+            },
+            OccPos {
+                doc_id: 2,
+                line: 200,
+                col: 0,
+            },
+            OccPos {
+                doc_id: 5,
+                line: 1,
+                col: 1,
+            },
+        ];
+        let enc = encode_occurrences(&occs);
+        let dec = decode_occurrences(&enc, occs.len()).unwrap();
+        assert_eq!(dec, occs);
+    }
+
+    #[test]
+    fn occurrence_decode_rejects_huge_count() {
+        assert!(decode_occurrences(&[0xff], 10_000).is_err());
+    }
+
+    #[test]
+    fn occurrence_decode_rejects_same_doc_on_first_entry() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // invalid: same_doc on first entry
+        w.write_delta(1);
+        w.write_delta(1);
+        let enc = w.finish();
+        assert!(decode_occurrences(&enc, 1).is_err());
+    }
+
+    #[test]
+    fn occurrence_empty() {
+        assert!(encode_occurrences(&[]).is_empty());
+        assert!(decode_occurrences(&[], 0).unwrap().is_empty());
     }
 }

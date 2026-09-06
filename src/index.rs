@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::{self, CorpusInput, LoadOptions, SourceDoc};
-use crate::delta::{decode_gaps, encode_gaps};
+use crate::delta::{OccPos, decode_occurrences, encode_occurrences};
 use crate::intern::Dictionary;
 use crate::lex::{self, Occurrence, TokenMode};
 
@@ -45,8 +45,14 @@ impl Hit {
     }
 }
 
+/// On-disk index format version (bumped when layout changes).
+pub const INDEX_FORMAT_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Index layout version; must be [`INDEX_FORMAT_VERSION`].
+    #[serde(default)]
+    pub format_version: u32,
     pub backend: String,
     pub token_mode: TokenMode,
     pub doc_count: usize,
@@ -70,21 +76,13 @@ struct DocMeta {
     path: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Occ {
-    doc_id: u32,
-    line: u32,
-    col: u32,
-}
-
 /// In-memory / on-disk inverted index.
 #[derive(Debug, Clone)]
 pub struct Index {
     pub manifest: Manifest,
     dict: Dictionary,
     docs: Vec<DocMeta>,
-    occs: Vec<Occ>,
-    /// For each name id: (encoded gaps of occurrence indices, count).
+    /// For each name id: (encoded occurrence payloads, count).
     postings: Vec<(Vec<u8>, u32)>,
 }
 
@@ -96,7 +94,7 @@ impl Index {
             token_mode: self.manifest.token_mode.as_str().to_string(),
             docs: self.docs.len(),
             names: self.dict.len(),
-            occurrences: self.occs.len(),
+            occurrences: self.manifest.occurrence_count,
             posting_bytes,
         }
     }
@@ -112,12 +110,9 @@ impl Index {
             .postings
             .get(id as usize)
             .ok_or_else(|| anyhow::anyhow!("corrupt index: name id {id} missing from postings"))?;
-        let indices = decode_gaps(blob, *count as usize)?;
-        let mut hits = Vec::with_capacity(indices.len());
-        for idx in indices {
-            let occ = self.occs.get(idx as usize).ok_or_else(|| {
-                anyhow::anyhow!("corrupt postings: occurrence index {idx} out of range")
-            })?;
+        let occs = decode_occurrences(blob, *count as usize)?;
+        let mut hits = Vec::with_capacity(occs.len());
+        for occ in occs {
             let doc = self.docs.get(occ.doc_id as usize).ok_or_else(|| {
                 anyhow::anyhow!("corrupt postings: doc_id {} out of range", occ.doc_id)
             })?;
@@ -214,7 +209,6 @@ impl Index {
             )?;
             fs::write(tmp.join("dict.bin"), self.dict.to_bytes())?;
             fs::write(tmp.join("docs.json"), serde_json::to_vec(&self.docs)?)?;
-            fs::write(tmp.join("occs.bin"), pack_occs(&self.occs))?;
             fs::write(tmp.join("postings.bin"), pack_postings(&self.postings))?;
             Ok(())
         })();
@@ -249,9 +243,21 @@ impl Index {
 
     pub fn open_dir(dir: &Path) -> anyhow::Result<Self> {
         let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
+        if manifest.format_version != INDEX_FORMAT_VERSION {
+            let hint = if manifest.format_version == 0 || dir.join("occs.bin").is_file() {
+                " (pre-v2 index with occs.bin; re-run `scode index`)"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "unsupported index format version {} (expected {}){}",
+                manifest.format_version,
+                INDEX_FORMAT_VERSION,
+                hint
+            );
+        }
         let dict = Dictionary::from_bytes(&fs::read(dir.join("dict.bin"))?)?;
         let docs: Vec<DocMeta> = serde_json::from_slice(&fs::read(dir.join("docs.json"))?)?;
-        let occs = unpack_occs(&fs::read(dir.join("occs.bin"))?)?;
         let postings = unpack_postings(&fs::read(dir.join("postings.bin"))?)?;
         if postings.len() != dict.len() {
             anyhow::bail!(
@@ -264,7 +270,6 @@ impl Index {
             manifest,
             dict,
             docs,
-            occs,
             postings,
         })
     }
@@ -275,13 +280,13 @@ pub struct SearchMultiResult {
     pub hits: Vec<Hit>,
 }
 
-const INDEX_FILES: &[&str] = &[
-    "manifest.json",
-    "dict.bin",
-    "docs.json",
-    "occs.bin",
-    "postings.bin",
-];
+const INDEX_FILES: &[&str] = &["manifest.json", "dict.bin", "docs.json", "postings.bin"];
+/// v1 artifact; still allowed when replacing an existing index directory in place.
+const LEGACY_INDEX_FILES: &[&str] = &["occs.bin"];
+
+fn is_known_index_file(name: &str) -> bool {
+    INDEX_FILES.contains(&name) || LEGACY_INDEX_FILES.contains(&name)
+}
 
 /// Allow replace only for empty dirs or dirs that already look like an scode index.
 /// Prevents accidentally wiping unrelated files under `--out`.
@@ -301,12 +306,12 @@ fn ensure_replaceable_index_dir(dir: &Path) -> anyhow::Result<()> {
                 dir.display()
             );
         };
-        if !INDEX_FILES.contains(&name) {
+        if !is_known_index_file(name) {
             anyhow::bail!(
                 "refusing to replace {}: contains non-index entry `{name}` \
                  (expected only {}); use an empty directory or an existing scode index",
                 dir.display(),
-                INDEX_FILES.join(", ")
+                [INDEX_FILES, LEGACY_INDEX_FILES].concat().join(", ")
             );
         }
         let ft = entry.file_type()?;
@@ -347,37 +352,6 @@ fn promote_tmp(tmp: &Path, dir: &Path) -> anyhow::Result<()> {
         let _ = fs::remove_dir_all(tmp);
     }
     Ok(())
-}
-
-fn pack_occs(occs: &[Occ]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + occs.len() * 12);
-    out.extend_from_slice(&(occs.len() as u32).to_le_bytes());
-    for o in occs {
-        out.extend_from_slice(&o.doc_id.to_le_bytes());
-        out.extend_from_slice(&o.line.to_le_bytes());
-        out.extend_from_slice(&o.col.to_le_bytes());
-    }
-    out
-}
-
-fn unpack_occs(mut data: &[u8]) -> anyhow::Result<Vec<Occ>> {
-    if data.len() < 4 {
-        anyhow::bail!("truncated occs");
-    }
-    let n = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-    data = &data[4..];
-    if data.len() < n * 12 {
-        anyhow::bail!("truncated occs payload");
-    }
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let doc_id = u32::from_le_bytes(data[..4].try_into().unwrap());
-        let line = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let col = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        data = &data[12..];
-        out.push(Occ { doc_id, line, col });
-    }
-    Ok(out)
 }
 
 fn pack_postings(postings: &[(Vec<u8>, u32)]) -> Vec<u8> {
@@ -441,8 +415,7 @@ pub fn build_index(
 pub fn build_from_docs(docs_in: Vec<SourceDoc>, token_mode: TokenMode) -> anyhow::Result<Index> {
     let mut dict = Dictionary::new();
     let mut docs = Vec::with_capacity(docs_in.len());
-    let mut occs = Vec::new();
-    let mut posting_lists: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut posting_lists: BTreeMap<u32, Vec<OccPos>> = BTreeMap::new();
 
     let mut tokenized: Vec<(SourceDoc, Vec<Occurrence>)> = docs_in
         .into_par_iter()
@@ -462,38 +435,38 @@ pub fn build_from_docs(docs_in: Vec<SourceDoc>, token_mode: TokenMode) -> anyhow
         });
         for o in file_occs {
             let name_id = dict.intern(&o.name);
-            let occ_id = occs.len() as u32;
-            occs.push(Occ {
+            posting_lists.entry(name_id).or_default().push(OccPos {
                 doc_id,
                 line: o.line,
                 col: o.col,
             });
-            posting_lists.entry(name_id).or_default().push(occ_id);
         }
     }
 
     let mut postings = vec![(Vec::new(), 0u32); dict.len()];
-    for (name_id, mut indices) in posting_lists {
-        indices.sort_unstable();
-        indices.dedup();
-        let count = indices.len() as u32;
-        let blob = encode_gaps(&indices);
+    let mut occurrence_count = 0usize;
+    for (name_id, mut occs) in posting_lists {
+        occs.sort_by_key(|o| (o.doc_id, o.line, o.col));
+        occs.dedup_by_key(|o| (o.doc_id, o.line, o.col));
+        let count = occs.len() as u32;
+        occurrence_count += occs.len();
+        let blob = encode_occurrences(&occs);
         postings[name_id as usize] = (blob, count);
     }
 
     let manifest = Manifest {
+        format_version: INDEX_FORMAT_VERSION,
         backend: "delta".into(),
         token_mode,
         doc_count: docs.len(),
         name_count: dict.len(),
-        occurrence_count: occs.len(),
+        occurrence_count,
     };
 
     Ok(Index {
         manifest,
         dict,
         docs,
-        occs,
         postings,
     })
 }
@@ -696,6 +669,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_pre_v2_index_with_occs_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            format_version: 0,
+            backend: "delta".into(),
+            token_mode: TokenMode::Idents,
+            doc_count: 0,
+            name_count: 0,
+            occurrence_count: 0,
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("occs.bin"), b"legacy").unwrap();
+        let err = Index::open_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unsupported index format version"), "{err}");
+        assert!(err.contains("occs.bin"), "{err}");
+    }
+
+    #[test]
     fn persist_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let docs = vec![SourceDoc {
@@ -708,6 +703,38 @@ mod tests {
         let loaded = Index::open_dir(dir.path()).unwrap();
         assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
         assert_eq!(loaded.stats().names, idx.stats().names);
+    }
+
+    #[test]
+    fn replaces_legacy_v1_index_dir_with_occs_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            backend: "delta".into(),
+            token_mode: TokenMode::Idents,
+            doc_count: 0,
+            name_count: 0,
+            occurrence_count: 0,
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("dict.bin"), b"").unwrap();
+        fs::write(dir.path().join("docs.json"), b"[]").unwrap();
+        fs::write(dir.path().join("occs.bin"), b"legacy").unwrap();
+        fs::write(dir.path().join("postings.bin"), [0u8, 0, 0, 0]).unwrap();
+        let docs = vec![SourceDoc {
+            gav: "g:a:1".into(),
+            path: "X.java".into(),
+            text: "class X { Bar b; }\n".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        idx.write_to_dir(dir.path()).unwrap();
+        assert!(!dir.path().join("occs.bin").exists());
+        let loaded = Index::open_dir(dir.path()).unwrap();
+        assert_eq!(loaded.search("Bar", None).unwrap().len(), 1);
     }
 
     #[test]
