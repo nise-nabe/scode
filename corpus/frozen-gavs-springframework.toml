@@ -1,0 +1,48 @@
+# Sample keep-set: Spring Framework-related sources jars (optional fetch).
+#
+# Prefer local Maven/Gradle caches. Use --fetch --repository only when missing.
+
+[[artifacts]]
+group = "org.springframework"
+artifact = "spring-context"
+version = "7.0.9"
+
+[[artifacts]]
+group = "org.springframework"
+artifact = "spring-core"
+version = "7.0.9"
+
+[[artifacts]]
+group = "org.springframework"
+artifact = "spring-beans"
+version = "7.0.9"
+
+[[artifacts]]
+group = "org.springframework"
+artifact = "spring-aop"
+version = "7.0.9"
+
+[[artifacts]]
+group = "org.springframework"
+artifact = "spring-expression"
+version = "7.0.9"
+
+[[artifacts]]
+group = "io.micrometer"
+artifact = "micrometer-observation"
+version = "1.14.0"
+
+[[artifacts]]
+group = "io.micrometer"
+artifact = "micrometer-commons"
+version = "1.14.0"
+
+[[artifacts]]
+group = "commons-logging"
+artifact = "commons-logging"
+version = "1.2"
+
+[[artifacts]]
+group = "org.jspecify"
+artifact = "jspecify"
+version = "1.0.0"

@@ -1,0 +1,5 @@
+/target
+.scode-cache/
+**/.scode-cache/
+*.swp
+.DS_Store
