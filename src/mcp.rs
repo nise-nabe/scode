@@ -4,16 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::{
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::corpus::LoadOptions;
+use crate::index::{Index, MemoryStore, index_and_maybe_write};
 use crate::lex::TokenMode;
-use crate::index::{index_and_maybe_write, Index, MemoryStore};
 
 #[derive(Clone)]
 pub struct ScodeMcp {

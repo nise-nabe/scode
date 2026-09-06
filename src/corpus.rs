@@ -146,10 +146,17 @@ impl GavEntry {
                     "no remote repository for {}:{}:{} — not found in local Maven/Gradle caches; \
                      set TOML/CLI `repository`, per-artifact `sources_url`, or install the \
                      sources jar into the local Maven repository",
-                    self.group, self.artifact, self.version
+                    self.group,
+                    self.artifact,
+                    self.version
                 )
             })?;
-        Ok(maven_sources_url(repo, &self.group, &self.artifact, &self.version))
+        Ok(maven_sources_url(
+            repo,
+            &self.group,
+            &self.artifact,
+            &self.version,
+        ))
     }
 }
 
@@ -288,10 +295,7 @@ fn load_tree(root: &Path, gav: &str) -> anyhow::Result<Vec<SourceDoc>> {
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "warning: skipping {}: {e}",
-                    path.display()
-                );
+                eprintln!("warning: skipping {}: {e}", path.display());
                 continue;
             }
         };
@@ -311,15 +315,12 @@ fn load_frozen(toml_path: &Path, opts: LoadOptions<'_>) -> anyhow::Result<Vec<So
     if file.artifacts.is_empty() {
         anyhow::bail!("no [[artifacts]] in {}", toml_path.display());
     }
-    let cache = opts
-        .cache_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| {
-            toml_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(".scode-cache")
-        });
+    let cache = opts.cache_dir.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+        toml_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".scode-cache")
+    });
     fs::create_dir_all(&cache)?;
 
     let file_repo = file.repository.as_deref();
@@ -400,8 +401,8 @@ fn download_url(url: &str, dest: &Path) -> anyhow::Result<()> {
             .timeout(Duration::from_secs(300))
             .call()
             .map_err(|e| anyhow::anyhow!("download {url}: {e}"))?;
-        let mut file = fs::File::create(&tmp)
-            .map_err(|e| anyhow::anyhow!("create {}: {e}", tmp.display()))?;
+        let mut file =
+            fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("create {}: {e}", tmp.display()))?;
         let mut reader = resp.into_reader();
         copy_with_limit(&mut reader, &mut file, MAX_DOWNLOAD_BYTES)
             .map_err(|e| anyhow::anyhow!("write {}: {e}", tmp.display()))?;
@@ -460,13 +461,9 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
             );
         }
         let mut buf = Vec::new();
-        entry
-            .take(MAX_JAR_ENTRY_BYTES + 1)
-            .read_to_end(&mut buf)?;
+        entry.take(MAX_JAR_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_JAR_ENTRY_BYTES {
-            anyhow::bail!(
-                "jar entry `{name}` exceeded size limit ({MAX_JAR_ENTRY_BYTES} bytes)"
-            );
+            anyhow::bail!("jar entry `{name}` exceeded size limit ({MAX_JAR_ENTRY_BYTES} bytes)");
         }
         let Ok(text) = String::from_utf8(buf) else {
             continue;
@@ -475,9 +472,7 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
             .checked_add(text.len() as u64)
             .ok_or_else(|| anyhow::anyhow!("jar uncompressed size overflow"))?;
         if total_bytes > MAX_JAR_TOTAL_BYTES {
-            anyhow::bail!(
-                "jar uncompressed content exceeds limit ({MAX_JAR_TOTAL_BYTES} bytes)"
-            );
+            anyhow::bail!("jar uncompressed content exceeds limit ({MAX_JAR_TOTAL_BYTES} bytes)");
         }
         docs.push(SourceDoc {
             gav: gav.to_string(),
@@ -489,19 +484,13 @@ fn load_sources_jar_reader<R: Read + io::Seek>(
     Ok(docs)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn maven_url_join_trims_slash() {
-        let url = maven_sources_url(
-            "https://example.corp/maven2/",
-            "com.acme",
-            "lib",
-            "1.2.3",
-        );
+        let url = maven_sources_url("https://example.corp/maven2/", "com.acme", "lib", "1.2.3");
         assert_eq!(
             url,
             "https://example.corp/maven2/com/acme/lib/1.2.3/lib-1.2.3-sources.jar"
@@ -518,20 +507,29 @@ mod tests {
             sources_url: Some("https://cdn.example/a-sources.jar".into()),
         };
         assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
+            gav.resolve_sources_url(
+                Some("https://file.example/m2"),
+                Some("https://cli.example/m2")
+            )
+            .unwrap(),
             "https://cdn.example/a-sources.jar"
         );
         gav.sources_url = None;
         assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
+            gav.resolve_sources_url(
+                Some("https://file.example/m2"),
+                Some("https://cli.example/m2")
+            )
+            .unwrap(),
             "https://entry.example/m2/g/a/1/a-1-sources.jar"
         );
         gav.repository = None;
         assert_eq!(
-            gav.resolve_sources_url(Some("https://file.example/m2"), Some("https://cli.example/m2"))
-                .unwrap(),
+            gav.resolve_sources_url(
+                Some("https://file.example/m2"),
+                Some("https://cli.example/m2")
+            )
+            .unwrap(),
             "https://cli.example/m2/g/a/1/a-1-sources.jar"
         );
         let err = gav.resolve_sources_url(None, None).unwrap_err().to_string();

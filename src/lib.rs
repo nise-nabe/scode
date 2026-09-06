@@ -8,9 +8,9 @@ pub mod lex;
 pub mod mcp;
 
 pub use corpus::{CorpusInput, LoadOptions, SourceDoc};
-pub use lex::TokenMode;
 pub use index::{
-    build_from_docs, build_index, index_and_maybe_write, Hit, Index, IndexStats, MemoryStore,
-    SearchMultiResult,
+    Hit, Index, IndexStats, MemoryStore, SearchMultiResult, build_from_docs, build_index,
+    index_and_maybe_write,
 };
 pub use lex::Occurrence;
+pub use lex::TokenMode;

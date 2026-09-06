@@ -4,11 +4,15 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use scode::corpus::LoadOptions;
+use scode::index::{Index, index_and_maybe_write};
 use scode::lex::TokenMode;
-use scode::index::{index_and_maybe_write, Index};
 
 #[derive(Debug, Parser)]
-#[command(name = "scode", version, about = "δ inverted-index name locate for Java/Kotlin sources")]
+#[command(
+    name = "scode",
+    version,
+    about = "δ inverted-index name locate for Java/Kotlin sources"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,

@@ -148,9 +148,7 @@ pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
     // Each Elias-δ value needs ≥1 bit; reject absurd counts before allocating.
     let max_bits = bytes.len().saturating_mul(8);
     if count > max_bits {
-        anyhow::bail!(
-            "posting count {count} exceeds bitstream capacity ({max_bits} bits)"
-        );
+        anyhow::bail!("posting count {count} exceeds bitstream capacity ({max_bits} bits)");
     }
     let mut r = BitReader::new(bytes);
     let mut out = Vec::with_capacity(count);
@@ -166,8 +164,7 @@ pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
             gap.checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("bad first Elias-δ gap"))?
         } else {
-            prev
-                .checked_add(gap)
+            prev.checked_add(gap)
                 .ok_or_else(|| anyhow::anyhow!("position overflow while decoding postings"))?
         };
         out.push(p);

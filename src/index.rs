@@ -105,9 +105,10 @@ impl Index {
         let Some(id) = self.dict.lookup(query) else {
             return Ok(Vec::new());
         };
-        let (blob, count) = self.postings.get(id as usize).ok_or_else(|| {
-            anyhow::anyhow!("corrupt index: name id {id} missing from postings")
-        })?;
+        let (blob, count) = self
+            .postings
+            .get(id as usize)
+            .ok_or_else(|| anyhow::anyhow!("corrupt index: name id {id} missing from postings"))?;
         let indices = decode_gaps(blob, *count as usize)?;
         let mut hits = Vec::with_capacity(indices.len());
         for idx in indices {
@@ -115,10 +116,7 @@ impl Index {
                 anyhow::anyhow!("corrupt postings: occurrence index {idx} out of range")
             })?;
             let doc = self.docs.get(occ.doc_id as usize).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "corrupt postings: doc_id {} out of range",
-                    occ.doc_id
-                )
+                anyhow::anyhow!("corrupt postings: doc_id {} out of range", occ.doc_id)
             })?;
             hits.push(Hit {
                 gav: doc.gav.clone(),
@@ -244,8 +242,7 @@ impl Index {
     }
 
     pub fn open_dir(dir: &Path) -> anyhow::Result<Self> {
-        let manifest: Manifest =
-            serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
+        let manifest: Manifest = serde_json::from_slice(&fs::read(dir.join("manifest.json"))?)?;
         let dict = Dictionary::from_bytes(&fs::read(dir.join("dict.bin"))?)?;
         let docs: Vec<DocMeta> = serde_json::from_slice(&fs::read(dir.join("docs.json"))?)?;
         let occs = unpack_occs(&fs::read(dir.join("occs.bin"))?)?;
@@ -394,9 +391,8 @@ fn unpack_postings(mut data: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, u32)>> {
         );
     }
     let mut out = Vec::new();
-    out.try_reserve_exact(n).map_err(|e| {
-        anyhow::anyhow!("postings count {n} too large to allocate: {e}")
-    })?;
+    out.try_reserve_exact(n)
+        .map_err(|e| anyhow::anyhow!("postings count {n} too large to allocate: {e}"))?;
     for _ in 0..n {
         if data.len() < 8 {
             anyhow::bail!("truncated posting header");
@@ -560,10 +556,7 @@ impl MemoryStore {
     /// Insert a disk-loaded index, returning any racing winner already present.
     pub fn insert_loaded_path(&mut self, path: &Path, index: Arc<Index>) -> Arc<Index> {
         let key = path.to_string_lossy().into_owned();
-        self.path_map
-            .entry(key)
-            .or_insert_with(|| index)
-            .clone()
+        self.path_map.entry(key).or_insert_with(|| index).clone()
     }
 
     pub fn unload_path(&mut self, path: &Path) -> bool {
@@ -670,7 +663,10 @@ mod tests {
         }];
         let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
         let err = idx.write_to_dir(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("non-index") || err.contains("refusing"), "{err}");
+        assert!(
+            err.contains("non-index") || err.contains("refusing"),
+            "{err}"
+        );
         assert!(dir.path().join("notes.txt").is_file());
     }
 }

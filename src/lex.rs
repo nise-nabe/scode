@@ -29,7 +29,6 @@ impl TokenMode {
     }
 }
 
-
 /// A single name occurrence in a source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
@@ -122,11 +121,11 @@ fn tokenize_idents(source: &str) -> Vec<Occurrence> {
                         line += 1;
                         line_start = ni + nc.len_utf8();
                     }
-                    if nc == '*' {
-                        if let Some(&(_, '/')) = chars.peek() {
-                            chars.next();
-                            break;
-                        }
+                    if nc == '*'
+                        && let Some(&(_, '/')) = chars.peek()
+                    {
+                        chars.next();
+                        break;
                     }
                 }
                 continue;
@@ -149,15 +148,15 @@ fn tokenize_idents(source: &str) -> Vec<Occurrence> {
                         line += 1;
                         line_start = ni + nc.len_utf8();
                     }
-                    if nc == '"' {
-                        if let Some(&(_, '"')) = chars.peek() {
-                            let mut look = chars.clone();
-                            look.next();
-                            if matches!(look.peek(), Some((_, '"'))) {
-                                chars.next();
-                                chars.next();
-                                break;
-                            }
+                    if nc == '"'
+                        && let Some(&(_, '"')) = chars.peek()
+                    {
+                        let mut look = chars.clone();
+                        look.next();
+                        if matches!(look.peek(), Some((_, '"'))) {
+                            chars.next();
+                            chars.next();
+                            break;
                         }
                     }
                 }
