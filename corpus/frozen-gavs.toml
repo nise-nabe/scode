@@ -1,4 +1,4 @@
-# Tree H — Apache HttpClient 5.6.4 compile/runtime closure (from paper draft).
+# Sample keep-set: Apache HttpClient-related sources jars (optional fetch).
 #
 # Prefer jars already resolved by Maven/Gradle into the local cache:
 #   scode index --input corpus/frozen-gavs.toml --out /tmp/scode-h

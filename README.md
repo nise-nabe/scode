@@ -1,8 +1,13 @@
 # scode
 
-Compressed **gap + Elias-δ** inverted indexes for **identifier name locate** over immutable Maven/Gradle `sources.jar` keep-sets (and plain source trees).
+**scode** indexes Java/Kotlin sources and answers: *where does this exact simple name appear?*
 
-Built from the Track A paper draft: on frozen library sources, δ postings beat a Huffman wavelet-matrix baseline for name locate; this repo ships the product δ path (CLI + MCP).
+It builds a compressed inverted index (gap + Elias-δ postings) over:
+
+- plain source trees, and
+- frozen Maven/Gradle `*-sources.jar` keep-sets (prefer jars already in local caches)
+
+and exposes the same locate flow via CLI and stdio MCP.
 
 ## Install
 
