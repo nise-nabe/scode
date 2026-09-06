@@ -148,10 +148,12 @@ pub fn decode_gaps(bytes: &[u8], count: usize) -> anyhow::Result<Vec<u32>> {
     let mut out = Vec::with_capacity(count);
     let mut prev = 0u32;
     for i in 0..count {
-        let gap = r
+        let gap_u64 = r
             .read_delta()
-            .ok_or_else(|| anyhow::anyhow!("truncated or corrupt Elias-δ stream"))?
-            as u32;
+            .ok_or_else(|| anyhow::anyhow!("truncated or corrupt Elias-δ stream"))?;
+        let gap: u32 = gap_u64
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Elias-δ gap does not fit in u32"))?;
         let p = if i == 0 {
             gap.checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("bad first Elias-δ gap"))?
@@ -202,6 +204,15 @@ mod tests {
         assert!(decode_gaps(&[], 1).is_err());
         let enc = encode_gaps(&[1, 2, 3]);
         assert!(decode_gaps(&enc, 4).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_gap_not_fitting_u32() {
+        // Manually craft Elias-δ for a value > u32::MAX.
+        let mut w = BitWriter::new();
+        w.write_delta(u64::from(u32::MAX) + 2); // first gap = pos+1
+        let enc = w.finish();
+        assert!(decode_gaps(&enc, 1).is_err());
     }
 
     #[test]

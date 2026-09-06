@@ -109,8 +109,15 @@ impl Index {
         let indices = decode_gaps(blob, *count as usize)?;
         let mut hits = Vec::with_capacity(indices.len());
         for idx in indices {
-            let occ = self.occs[idx as usize];
-            let doc = &self.docs[occ.doc_id as usize];
+            let occ = self.occs.get(idx as usize).ok_or_else(|| {
+                anyhow::anyhow!("corrupt postings: occurrence index {idx} out of range")
+            })?;
+            let doc = self.docs.get(occ.doc_id as usize).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "corrupt postings: doc_id {} out of range",
+                    occ.doc_id
+                )
+            })?;
             hits.push(Hit {
                 gav: doc.gav.clone(),
                 path: doc.path.clone(),
