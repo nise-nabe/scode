@@ -121,6 +121,21 @@ fn map_err(e: anyhow::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
+fn validate_memory_id(id: &str) -> anyhow::Result<()> {
+    let id = id.trim();
+    if id.is_empty() {
+        anyhow::bail!("memory_id must not be empty");
+    }
+    // Reserved / ambiguous with resolve_index defaults and path targets.
+    if id == "memory" {
+        anyhow::bail!("memory_id `{id}` is reserved; choose another id");
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') {
+        anyhow::bail!("memory_id must not look like a filesystem path");
+    }
+    Ok(())
+}
+
 impl ScodeMcp {
     /// Resolve an index without holding the async mutex across disk IO or rayon work.
     async fn resolve_index(&self, index_arg: Option<&str>) -> Result<Arc<Index>, McpError> {
@@ -141,6 +156,15 @@ impl ScodeMcp {
                 "no in-memory index; call scode_index first"
             )));
         };
+
+        // Prefer an explicit memory slot over treating a colliding filesystem path as an index.
+        {
+            let store = self.store.lock().await;
+            if let Some(mem) = store.get_memory(p) {
+                return Ok(mem);
+            }
+        }
+
         let path = PathBuf::from(p);
         if path.exists() {
             let path_for_load = path.clone();
@@ -151,10 +175,7 @@ impl ScodeMcp {
             let mut store = self.store.lock().await;
             Ok(store.insert_loaded_path(&path, Arc::new(loaded)))
         } else {
-            let store = self.store.lock().await;
-            store
-                .get_memory(p)
-                .ok_or_else(|| map_err(anyhow::anyhow!("index not found: {p}")))
+            Err(map_err(anyhow::anyhow!("index not found: {p}")))
         }
     }
 }
@@ -177,6 +198,7 @@ impl ScodeMcp {
         let repository = args.repository.clone();
         let fetch = args.fetch;
         let memory_id = args.memory_id.clone();
+        validate_memory_id(&memory_id).map_err(map_err)?;
 
         let index = tokio::task::spawn_blocking(move || {
             index_and_maybe_write(
@@ -222,9 +244,23 @@ impl ScodeMcp {
             .await
             .map_err(|e| map_err(anyhow::anyhow!("search task join: {e}")))?
             .map_err(map_err)?;
-        let from_memory = match args.index.as_deref() {
-            None | Some("") | Some("memory") => true,
-            Some(p) => !Path::new(p).exists(),
+        let from_memory = {
+            let store = self.store.lock().await;
+            match args.index.as_deref() {
+                None | Some("") | Some("memory") => true,
+                Some(p) => {
+                    let path = Path::new(p);
+                    // Prefer store state over filesystem so memory ids that look like
+                    // paths (or collide with real paths) report correctly.
+                    if store.has_loaded_path(path) {
+                        false
+                    } else if store.get_memory(p).is_some() {
+                        true
+                    } else {
+                        !path.exists()
+                    }
+                }
+            }
         };
         text_ok(serde_json::json!({
             "query": args.query,
@@ -301,13 +337,18 @@ impl ScodeMcp {
         Parameters(args): Parameters<UnloadArgs>,
     ) -> Result<CallToolResult, McpError> {
         let target = args.target.as_str();
-        // Filesystem checks before taking the async mutex to avoid stalling other MCP calls.
+        // Filesystem check before the async mutex so we do not stall other MCP calls.
         let path = Path::new(target);
         let path_exists = target != "memory" && path.exists();
         let mut store = self.store.lock().await;
+        // Same precedence as resolve/peek: loaded path → memory slot → on-disk path.
         let removed = if target == "memory" {
             store.unload_memory("default")
-        } else if path_exists || store.has_loaded_path(path) {
+        } else if store.has_loaded_path(path) {
+            store.unload_path(path)
+        } else if store.get_memory(target).is_some() {
+            store.unload_memory(target)
+        } else if path_exists {
             store.unload_path(path)
         } else {
             store.unload_memory(target)

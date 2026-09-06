@@ -579,10 +579,12 @@ impl MemoryStore {
                 .ok_or_else(|| anyhow::anyhow!("no in-memory index; call scode_index first")),
             Some(p) => {
                 let path = Path::new(p);
-                if path.exists() {
-                    self.load_path(path)
-                } else if let Some(mem) = self.get_memory(p) {
+                // loaded path (via peek/path_map) is handled by callers; here prefer memory
+                // slot ids over colliding filesystem paths.
+                if let Some(mem) = self.get_memory(p) {
                     Ok(mem)
+                } else if self.has_loaded_path(path) || path.exists() {
+                    self.load_path(path)
                 } else {
                     anyhow::bail!("index not found: {p}")
                 }
@@ -671,5 +673,48 @@ mod tests {
             "{err}"
         );
         assert!(dir.path().join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn memory_id_preferred_over_filesystem_path() {
+        let docs = vec![SourceDoc {
+            gav: "demo:lib:1".into(),
+            path: "Foo.java".into(),
+            text: "class Foo {}".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let mut store = MemoryStore::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let collision = tmp.path().join("slot");
+        std::fs::create_dir_all(&collision).unwrap();
+        // Write a tiny valid-looking dir is unnecessary; exists() alone matters for resolve.
+        let key = collision.to_string_lossy().into_owned();
+        store.insert_memory(&key, idx);
+        let got = store.resolve(Some(&key)).unwrap();
+        assert!(store.get_memory(&key).is_some());
+        // Should not attempt to load the empty directory as an index.
+        assert_eq!(got.stats().docs, 1);
+    }
+
+    #[test]
+    fn unload_prefers_memory_slot_when_path_also_exists() {
+        let docs = vec![SourceDoc {
+            gav: "demo:lib:1".into(),
+            path: "Foo.java".into(),
+            text: "class Foo {}".into(),
+        }];
+        let idx = build_from_docs(docs, TokenMode::Idents).unwrap();
+        let mut store = MemoryStore::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let collision = tmp.path().join("slot");
+        std::fs::create_dir_all(&collision).unwrap();
+        let key = collision.to_string_lossy().into_owned();
+        store.insert_memory(&key, idx);
+        // Mimic scode_unload precedence without filesystem-first.
+        let path = Path::new(&key);
+        assert!(!store.has_loaded_path(path));
+        assert!(store.get_memory(&key).is_some());
+        assert!(store.unload_memory(&key));
+        assert!(store.get_memory(&key).is_none());
     }
 }
