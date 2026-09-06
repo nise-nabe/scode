@@ -297,6 +297,8 @@ impl Index {
                 "; re-run `scode index` to rebuild with format v3"
             } else if manifest.format_version == 0 || dir.join("occs.bin").is_file() {
                 " (pre-v2 index with occs.bin; re-run `scode index`)"
+            } else if manifest.format_version < INDEX_FORMAT_VERSION {
+                "; re-run `scode index` to rebuild"
             } else {
                 ""
             };
@@ -449,9 +451,7 @@ fn pack_postings(postings: &Postings) -> anyhow::Result<Vec<u8>> {
     let mut data_offset = 0u32;
     let mut table_pos = 4usize;
     for id in 0..n {
-        let (blob, count) = postings
-            .get(id)
-            .expect("pack_postings iterates only valid posting ids");
+        let (blob, count) = postings.get(id)?;
         let len = u32_from_usize(blob.len(), "posting blob length")?;
         out[table_pos..table_pos + 4].copy_from_slice(&count.to_le_bytes());
         out[table_pos + 4..table_pos + 8].copy_from_slice(&data_offset.to_le_bytes());
@@ -791,6 +791,30 @@ mod tests {
         let err = Index::open_dir(dir.path()).unwrap_err().to_string();
         assert!(err.contains("unsupported index format version"), "{err}");
         assert!(err.contains("format v3"), "{err}");
+    }
+
+    #[test]
+    fn rejects_v1_index_with_rebuild_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = Manifest {
+            format_version: 1,
+            backend: "delta".into(),
+            token_mode: TokenMode::Idents,
+            doc_count: 0,
+            name_count: 0,
+            occurrence_count: 0,
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("dict.bin"), b"").unwrap();
+        fs::write(dir.path().join("docs.json"), b"[]").unwrap();
+        fs::write(dir.path().join("postings.bin"), [0u8, 0, 0, 0]).unwrap();
+        let err = Index::open_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unsupported index format version"), "{err}");
+        assert!(err.contains("re-run `scode index` to rebuild"), "{err}");
     }
 
     #[test]

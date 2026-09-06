@@ -67,7 +67,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Current bit offset into the stream (for mmap skip hooks).
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn position(&self) -> usize {
         self.pos
     }
