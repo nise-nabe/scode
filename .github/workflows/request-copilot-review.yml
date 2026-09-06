@@ -1,0 +1,24 @@
+name: Request Copilot Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+        type: string
+
+permissions:
+  pull-requests: write
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request Copilot review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/requested_reviewers" \
+            --method POST \
+            -f 'reviewers[]=copilot-pull-request-reviewer[bot]'
